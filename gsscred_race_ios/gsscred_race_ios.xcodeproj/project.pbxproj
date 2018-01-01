@@ -7,6 +7,11 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		55BEB8FC1FF5DF2D008B8F93 /* gadgets.c in Sources */ = {isa = PBXBuildFile; fileRef = 55BEB8FA1FF5DF2D008B8F93 /* gadgets.c */; };
+		55BEB8FF1FF62713008B8F93 /* payload.c in Sources */ = {isa = PBXBuildFile; fileRef = 55BEB8FD1FF62713008B8F93 /* payload.c */; };
+		55BEB9031FF62723008B8F93 /* payload_strategy_1.c in Sources */ = {isa = PBXBuildFile; fileRef = 55BEB9001FF62723008B8F93 /* payload_strategy_1.c */; };
+		55BEB9041FF62723008B8F93 /* arm64_payload.c in Sources */ = {isa = PBXBuildFile; fileRef = 55BEB9021FF62723008B8F93 /* arm64_payload.c */; };
+		55BEB9071FF6E9EA008B8F93 /* log.c in Sources */ = {isa = PBXBuildFile; fileRef = 55BEB9061FF6E9EA008B8F93 /* log.c */; };
 		55DC4C5E1FE3A34100E1D18D /* AppDelegate.m in Sources */ = {isa = PBXBuildFile; fileRef = 55DC4C5D1FE3A34100E1D18D /* AppDelegate.m */; };
 		55DC4C611FE3A34100E1D18D /* ViewController.m in Sources */ = {isa = PBXBuildFile; fileRef = 55DC4C601FE3A34100E1D18D /* ViewController.m */; };
 		55DC4C641FE3A34100E1D18D /* Main.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 55DC4C621FE3A34100E1D18D /* Main.storyboard */; };
@@ -18,6 +23,16 @@
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
+		55BEB8ED1FF5DD1D008B8F93 /* apple_private.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = apple_private.h; sourceTree = "<group>"; };
+		55BEB8FA1FF5DF2D008B8F93 /* gadgets.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; path = gadgets.c; sourceTree = "<group>"; };
+		55BEB8FB1FF5DF2D008B8F93 /* gadgets.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = gadgets.h; sourceTree = "<group>"; };
+		55BEB8FD1FF62713008B8F93 /* payload.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; path = payload.c; sourceTree = "<group>"; };
+		55BEB8FE1FF62713008B8F93 /* payload.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = payload.h; sourceTree = "<group>"; };
+		55BEB9001FF62723008B8F93 /* payload_strategy_1.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; path = payload_strategy_1.c; sourceTree = "<group>"; };
+		55BEB9011FF62723008B8F93 /* arm64_payload.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = arm64_payload.h; sourceTree = "<group>"; };
+		55BEB9021FF62723008B8F93 /* arm64_payload.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; path = arm64_payload.c; sourceTree = "<group>"; };
+		55BEB9051FF6E9EA008B8F93 /* log.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = log.h; sourceTree = "<group>"; };
+		55BEB9061FF6E9EA008B8F93 /* log.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; path = log.c; sourceTree = "<group>"; };
 		55DC4C591FE3A34100E1D18D /* gsscred_race_ios.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = gsscred_race_ios.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		55DC4C5C1FE3A34100E1D18D /* AppDelegate.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = AppDelegate.h; sourceTree = "<group>"; };
 		55DC4C5D1FE3A34100E1D18D /* AppDelegate.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = AppDelegate.m; sourceTree = "<group>"; };
@@ -44,6 +59,18 @@
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
+		55BEB8F91FF5DF2D008B8F93 /* arm64 */ = {
+			isa = PBXGroup;
+			children = (
+				55BEB9021FF62723008B8F93 /* arm64_payload.c */,
+				55BEB9011FF62723008B8F93 /* arm64_payload.h */,
+				55BEB8FA1FF5DF2D008B8F93 /* gadgets.c */,
+				55BEB8FB1FF5DF2D008B8F93 /* gadgets.h */,
+				55BEB9001FF62723008B8F93 /* payload_strategy_1.c */,
+			);
+			path = arm64;
+			sourceTree = "<group>";
+		};
 		55DC4C501FE3A34100E1D18D = {
 			isa = PBXGroup;
 			children = (
@@ -81,8 +108,14 @@
 		55DC4C791FE3A6BD00E1D18D /* gsscred_race */ = {
 			isa = PBXGroup;
 			children = (
+				55BEB8F91FF5DF2D008B8F93 /* arm64 */,
+				55BEB8ED1FF5DD1D008B8F93 /* apple_private.h */,
 				55DC4C7A1FE3A6BD00E1D18D /* gsscred_race.c */,
 				55DC4C7C1FE3A6F200E1D18D /* gsscred_race.h */,
+				55BEB9061FF6E9EA008B8F93 /* log.c */,
+				55BEB9051FF6E9EA008B8F93 /* log.h */,
+				55BEB8FD1FF62713008B8F93 /* payload.c */,
+				55BEB8FE1FF62713008B8F93 /* payload.h */,
 			);
 			name = gsscred_race;
 			path = ../gsscred_race;
@@ -160,10 +193,15 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				55BEB9071FF6E9EA008B8F93 /* log.c in Sources */,
 				55DC4C7B1FE3A6BD00E1D18D /* gsscred_race.c in Sources */,
+				55BEB8FC1FF5DF2D008B8F93 /* gadgets.c in Sources */,
+				55BEB8FF1FF62713008B8F93 /* payload.c in Sources */,
+				55BEB9041FF62723008B8F93 /* arm64_payload.c in Sources */,
 				55DC4C611FE3A34100E1D18D /* ViewController.m in Sources */,
 				55DC4C6C1FE3A34100E1D18D /* main.m in Sources */,
 				55DC4C5E1FE3A34100E1D18D /* AppDelegate.m in Sources */,
+				55BEB9031FF62723008B8F93 /* payload_strategy_1.c in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -305,6 +343,7 @@
 				PRODUCT_BUNDLE_IDENTIFIER = "com.github.bazad.gsscred-race-ios";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				TARGETED_DEVICE_FAMILY = "1,2";
+				USER_HEADER_SEARCH_PATHS = "$(SRCROOT)/../gsscred_race";
 			};
 			name = Debug;
 		};
@@ -320,6 +359,7 @@
 				PRODUCT_BUNDLE_IDENTIFIER = "com.github.bazad.gsscred-race-ios";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				TARGETED_DEVICE_FAMILY = "1,2";
+				USER_HEADER_SEARCH_PATHS = "$(SRCROOT)/../gsscred_race";
 			};
 			name = Release;
 		};

