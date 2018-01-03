@@ -18,7 +18,7 @@
 
 - (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
 	dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-		gsscred_race();
+		mach_port_t gsscred_task = gsscred_race();
 	});
 	// Override point for customization after application launch.
 	return YES;
