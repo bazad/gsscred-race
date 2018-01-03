@@ -272,9 +272,10 @@
  *
  *  Fortunately for us, both OS_xpc_string and CFString (for certain string lengths) are also
  *  allocated out of the 0x30 freelist. It's possible to target either data structure for the
- *  exploit, but I eventually settled on CFString because it seems easier to win that race window.
+ *  exploit, but I eventually settled on CFString because it seems easier to win the corresponding
+ *  race window.
  *
- *  Immutable CFString objects as allocated with their character data inline. This is what the
+ *  Immutable CFString objects are allocated with their character data inline. This is what the
  *  structure looks like for short strings:
  *
  *  	struct CFString {
@@ -409,17 +410,69 @@
  *  		notifyChangedCaches();
  *  	}
  *
- *  Since we will make the corrupted HeimCred's "mech" field point to our heap spray data it will
+ *  Since we will make the corrupted HeimCred's "mech" field point to our heap spray data, it will
  *  never be NULL, so the assertion will pass. Next, the "mech" field will be dereferenced to read
  *  the "name" pointer, which is passed to CFDictionaryGetValue(). This is perfect: we can make our
  *  fake HeimMech's "name" pointer also point into the heap spray data. We will construct a fake
  *  Objective-C object such that when CFDictionaryGetValue() sends a message to it we end up with
  *  PC control.
  *
- *  So, to summarize our progress so far, we can corrupt the HeimCred object such that its "mech"
- *  pointer points to a fake HeimMech object, and the HeimMech's "name" field points to another
- *  fake object whose contents we fully control. And we're about to enter a call to
- *  CFDictionaryGetValue() with our "name" pointer as the second parameter.
+ *  As it turns out, CFDictionaryGetValue() will send an Objective-C message with the "hash"
+ *  selector to its second argument. We can construct our fake "name" object so that its isa
+ *  pointer indicates that it responds to the "hash" selector with an Objective-C method whose
+ *  implementation pointer contains the PC value we want. For more complete details, refer to [2].
+ *
+ *  So, in summary, we can corrupt the HeimCred object such that its "mech" pointer points to a
+ *  fake HeimMech object, and the HeimMech's "name" field points to a fake Objective-C object whose
+ *  contents we fully control. The "name" pointer will be passed to CFDictionaryGetValue(), which
+ *  will invoke objc_msgSend() on the "name" pointer for the "hash" selector. The "name" object's
+ *  isa pointer will point to an objc_class object that indicates that "name" responds to the
+ *  "hash" selector with a particular method implementation. When objc_msgSend() invokes that
+ *  method, we get PC control, with the "name" pointer as the first argument.
+ *
+ *
+ *  Getting GSSCred's task port
+ *  ---------------------------
+ *
+ *  Controlling PC alone is not enough. We also need to construct a payload to execute in the
+ *  context of the GSSCred process that will accomplish useful work. In our case, we will try to
+ *  make GSSCred give us a send right to its task port, allowing us to manipulate the process
+ *  without having to re-exploit the race condition each time. Here we will describe the ARM64
+ *  payload.
+ *
+ *  When we get PC control, the X0 register will point to the fake "name" object. The "name"
+ *  object's isa pointer is already determined by the part of the payload that gets PC control, but
+ *  everything after the first 8 bytes can be used by the ARM64 payload.
+ *
+ *  My preferred technique for writing a payload when I can't inject code is to use jump-oriented
+ *  programming, or JOP. I used this vulnerability as an opportunity to practice writing more
+ *  complex JOP programs, and in particular to practice using loops and conditionals. I make no
+ *  claim that the strategy outlined here is the cleanest, best, or most efficient design. That
+ *  being said, here is my strategy.
+ *
+ *  Borrowing a technique from triple_fetch [1], I wanted to have the exploit payload send a Mach
+ *  message containing GSSCred's task port from GSSCred back to our process. The challenge is that
+ *  we don't know what port to send this message to, such that we can receive the message back in
+ *  our process. We could create a Mach port in our process to which we have the receive right,
+ *  then send the corresponding send right over to GSSCred, but we don't know what port name the
+ *  kernel will assign that send right over in GSSCred.
+ *
+ *  The triple_fetch exploit gets around this limitation by sending a message with thousands of
+ *  Mach send rights, spraying the target's Mach port namespace so that with high probability one
+ *  of the hardcoded Mach port names used in the payload will be a send right back to the
+ *  exploiting process.
+ *
+ *  I decided to try the inverse: send a single Mach send right, then have the exploit payload try
+ *  to send the Mach message to thousands of different Mach port names, hopefully hitting the one
+ *  corresponding to the send right back to our process. One prominent advantage of this design is
+ *  that it can take up significantly less space (we no longer need a massive Mach port spray, and
+ *  the ARM64-specific part of the payload could easily be packed down to 400 bytes).
+ *
+ *  The other strategy I was contemplating was to try and deduce the Mach send right name directly,
+ *  either by working backwards from the current register values or stack contents or by scanning
+ *  memory. However, this seemed more complicated and more fragile than simply spraying Mach
+ *  messages to every possible port name.
+ *
  *
  *  TODO
  *

