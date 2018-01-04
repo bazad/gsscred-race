@@ -7,14 +7,20 @@
 // payload, we may not find the specific gadgets we'd like to use in all builds and on all
 // platforms. You can add a new strategy to support a new build and platform.
 struct payload_strategy {
+	// Check if this payload is suitable for the current platform.
 	bool (*check_platform)(void);
-	void (*build_payload)(uint8_t *payload);
+	// Build the payload in the specified payload buffer.
+	platform_payload_generator_fn build_payload;
+	// Process the Mach message sent by the exploit payload. Returns a task port and a thread
+	// port for a thread in the task. Any post-processing needed to stabilize the process after
+	// the exploit happens here.
+	payload_message_processor_fn process_message;
 };
 
 // The currently defined strategies.
 extern const struct payload_strategy payload_strategy_1;
 
 // Choose the payload generation strategy most suitable for the current arm64 platform.
-gsscred_race_platform_payload_generator_fn arm64_choose_payload(void);
+const struct payload_strategy *arm64_choose_payload(void);
 
 #endif

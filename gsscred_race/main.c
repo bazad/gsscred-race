@@ -10,10 +10,11 @@
 #include "gsscred_race.h"
 
 int main(int argc, const char *argv[]) {
-	mach_port_t gsscred_task = gsscred_race();
-	if (gsscred_task == MACH_PORT_NULL) {
+	mach_port_t gsscred_task, gsscred_thread;
+	bool success = gsscred_race(&gsscred_task, &gsscred_thread);
+	if (!success) {
 		return 1;
 	}
-	task_terminate(gsscred_task);
+	thread_terminate(gsscred_thread);
 	return 0;
 }

