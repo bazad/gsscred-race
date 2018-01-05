@@ -19,7 +19,6 @@
 		55DC4C691FE3A34100E1D18D /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 55DC4C671FE3A34100E1D18D /* LaunchScreen.storyboard */; };
 		55DC4C6C1FE3A34100E1D18D /* main.m in Sources */ = {isa = PBXBuildFile; fileRef = 55DC4C6B1FE3A34100E1D18D /* main.m */; };
 		55DC4C7B1FE3A6BD00E1D18D /* gsscred_race.c in Sources */ = {isa = PBXBuildFile; fileRef = 55DC4C7A1FE3A6BD00E1D18D /* gsscred_race.c */; };
-		55DC4C7E1FE3A86D00E1D18D /* include in Resources */ = {isa = PBXBuildFile; fileRef = 55DC4C7D1FE3A86D00E1D18D /* include */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -45,7 +44,6 @@
 		55DC4C6B1FE3A34100E1D18D /* main.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = main.m; sourceTree = "<group>"; };
 		55DC4C7A1FE3A6BD00E1D18D /* gsscred_race.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; path = gsscred_race.c; sourceTree = "<group>"; };
 		55DC4C7C1FE3A6F200E1D18D /* gsscred_race.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = gsscred_race.h; sourceTree = "<group>"; };
-		55DC4C7D1FE3A86D00E1D18D /* include */ = {isa = PBXFileReference; lastKnownFileType = folder; name = include; path = ../include; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -74,7 +72,6 @@
 		55DC4C501FE3A34100E1D18D = {
 			isa = PBXGroup;
 			children = (
-				55DC4C7D1FE3A86D00E1D18D /* include */,
 				55DC4C791FE3A6BD00E1D18D /* gsscred_race */,
 				55DC4C5B1FE3A34100E1D18D /* gsscred_race_ios */,
 				55DC4C5A1FE3A34100E1D18D /* Products */,
@@ -182,7 +179,6 @@
 				55DC4C691FE3A34100E1D18D /* LaunchScreen.storyboard in Resources */,
 				55DC4C661FE3A34100E1D18D /* Assets.xcassets in Resources */,
 				55DC4C641FE3A34100E1D18D /* Main.storyboard in Resources */,
-				55DC4C7E1FE3A86D00E1D18D /* include in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -337,7 +333,6 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_STYLE = Automatic;
 				DEVELOPMENT_TEAM = DEEG7TTSF2;
-				HEADER_SEARCH_PATHS = "$(SRCROOT)/../include";
 				INFOPLIST_FILE = gsscred_race_ios/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks";
 				PRODUCT_BUNDLE_IDENTIFIER = "com.github.bazad.gsscred-race-ios";
@@ -353,7 +348,6 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_STYLE = Automatic;
 				DEVELOPMENT_TEAM = DEEG7TTSF2;
-				HEADER_SEARCH_PATHS = "$(SRCROOT)/../include";
 				INFOPLIST_FILE = gsscred_race_ios/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks";
 				PRODUCT_BUNDLE_IDENTIFIER = "com.github.bazad.gsscred-race-ios";

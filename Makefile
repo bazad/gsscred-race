@@ -15,10 +15,6 @@ CODESIGN := codesign
 
 CFLAGS = -O2 -Wall -Werror
 
-ifneq ($(ARCH),x86_64)
-CFLAGS += -Iinclude
-endif
-
 ifneq ($(DEBUG),0)
 DEFINES += -DDEBUG=$(DEBUG)
 endif

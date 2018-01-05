@@ -520,7 +520,6 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <xpc/xpc.h>
 
 // ---- Some definitions from Heimdal-520 ---------------------------------------------------------
 
