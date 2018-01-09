@@ -7,10 +7,10 @@
  * ================================================================================================
  *
  *  gsscred-race is an exploit for a race condition found in the com.apple.GSSCred XPC service,
- *  which runs as root on macOS and iOS and which can be reached from within the default iOS
- *  application sandbox. By creating parallel connections to the GSSCred service we can trigger a
- *  use-after-free condition leading to a call to objc_msgSend() on a controlled pointer,
- *  eventually leading to code execution inside the GSSCred process.
+ *  which runs as root on macOS and iOS (although it is sandboxed on iOS) and which can be reached
+ *  from within the default iOS application sandbox. By creating parallel connections to the
+ *  GSSCred service we can trigger a use-after-free condition leading to a call to objc_msgSend()
+ *  on a controlled pointer, eventually leading to code execution inside the GSSCred process.
  *
  *
  * The vulnerability
@@ -483,22 +483,17 @@
  *  a message. If a message is received, that means we won the race and the exploit succeeded.
  *
  *
- *  TODO
+ *  Gained access
+ *  -------------
  *
+ *  On macOS, GSSCred runs outside of any sandbox, meaning once we get the task port we have
+ *  unsandboxed arbitrary code execution as root.
  *
- *  Fine-tuning
- *  -----------
- *
- *  After I designed the basic exploit flow, I needed to choose specific values for various
- *  parameters.
- *
- *  In some experiments on my 2011 MacBook Pro, I measured that it usually took less than a
- *  millisecond (and often close to a fifth of that) between when I sent a message to GSSCred and
- *  when GSSCred sent back a reply. Thus, I figured that a 10 millisecond race window for the
- *  "delete" request would be plenty. Further experiments showed that in order to make
- *  deserializing an array of strings take 10 milliseconds, I needed the array to contain about
- *  26000 strings. However, using this many strings proved problematic on iOS due to the Jetsam
- *  limits, so I eventually scaled back to 10000 strings.
+ *  On iOS the story is a bit different. The GSSCred process enters the com.apple.GSSCred sandbox
+ *  immediately on startup, which restricts it from doing most interesting things. The kernel
+ *  attack surface from within the GSSCred sandbox does not appear significantly wider than from
+ *  within the container sandbox. Thus, GSSCred may be a stepping-stone on a longer journey to
+ *  unsandboxed code execution.
  *
  *
  * References
@@ -537,7 +532,7 @@ static const char *GSSCRED_SERVICE_NAME = "com.apple.GSSCred";
 static const size_t   UAF_STRING_COUNT              = 10000;
 
 static const unsigned POST_CREATE_CREDENTIAL_DELAY  = 10000;	// 10 ms
-static const unsigned RETRY_RACE_DELAY              = 200000;	// 200 ms
+static const unsigned RETRY_RACE_DELAY              = 50000;	// 50 ms
 
 static const unsigned INITIAL_SETATTRIBUTES_TO_DELETE_DELAY_US   = 0;
 static const unsigned SETATTRIBUTES_TO_DELETE_DELAY_INCREMENT_US = 200;
